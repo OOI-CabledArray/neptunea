@@ -259,22 +259,47 @@ def climatology_overlay(refdes, var, t0, t1):
 
 
 # --- Plot builders ---
+def _clamp(rng, lo, hi, to_dt=False):
+    """Clamp a requested axis range to the data extent. Bokeh can request
+    ranges far outside the data (deep zoom-out, inverted axes report
+    reversed), which makes the quadmesh rasterizer produce an Image whose
+    bounds fail validation — the long-standing blank-heatmap bug."""
+    if rng is None:
+        return None
+    a, b = sorted(np.datetime64(_to_timestamp(v)) if to_dt else v for v in rng)
+    a, b = max(a, lo), min(b, hi)
+    return (a, b) if a < b else (lo, hi)
+
+
 def heatmap(da, tdim, style, cmap_name):
     label = style["label"]
     hover = HoverTool(
         tooltips=[("time", "$x{%F %H:%M}"), ("pressure", "$y{0} dbar"), (label, "@image")],
         formatters={"$x": "datetime"},
     )
-    return da.hvplot.quadmesh(
-        x=tdim, y="sea_water_pressure",
-        cmap=cmocean.cm.cmap_d[cmap_name],
-        rasterize=True, colorbar=True, clabel=label,
-        xlabel="Time", ylabel="Pressure (dbar)",
-        min_height=350, responsive=True,
-    ).opts(
-        invert_yaxis=True, clim=style["clim"] or (None, None),
-        tools=[hover], shared_axes=False, **DATETIME_OPTS,
+    opts = dict(
+        cmap=cmocean.cm.cmap_d[cmap_name], colorbar=True, clabel=label,
+        clim=style["clim"] or (None, None), invert_yaxis=True,
+        xlabel="Time", ylabel="Pressure (dbar)", tools=[hover],
+        shared_axes=False, responsive=True, min_height=350, **DATETIME_OPTS,
     )
+    qm = hv.QuadMesh(da, kdims=[tdim, "sea_water_pressure"])
+    t = da[tdim].values
+    p = da["sea_water_pressure"].values
+    x0, x1 = t[0], t[-1]
+    y0, y1 = float(p.min()), float(p.max())
+
+    def view(x_range=None, y_range=None, width=None, height=None, scale=1.0):
+        return rasterize(
+            qm,
+            x_range=_clamp(x_range, x0, x1, to_dt=True),
+            y_range=_clamp(y_range, y0, y1),
+            width=int(min(max(width or 1200, 200), 4000)),
+            height=int(min(max(height or 400, 150), 2000)),
+            dynamic=False,
+        ).opts(**opts)
+
+    return hv.DynamicMap(view, streams=[hv.streams.RangeXY(), hv.streams.PlotSize()])
 
 
 def scatter_1d(da, tdim, style):
