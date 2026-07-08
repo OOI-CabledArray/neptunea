@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rca-panel-app"
+version = "0.1.0"
+description = "RCA QC Explorer: interactive Panel app for verifying OOI Regional Cabled Array data products"
+requires-python = ">=3.10"
+dependencies = [
+    "panel",
+    "hvplot",
+    "holoviews",
+    "datashader",
+    "bokeh",
+    "xarray",
+    "zarr",
+    "numpy",
+    "pandas",
+    "s3fs",
+    "cmocean",
+    "requests",
+    "python-dotenv",
+    "click",
+]
+
+[project.scripts]
+qc-explorer = "rca_panel_app.serve:main"
+
+[tool.setuptools]
+packages = ["rca_panel_app"]

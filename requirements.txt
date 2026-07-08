@@ -1,0 +1,14 @@
+panel
+hvplot
+holoviews
+datashader
+bokeh
+xarray
+zarr
+numpy
+pandas
+s3fs
+cmocean
+requests
+python-dotenv
+click
