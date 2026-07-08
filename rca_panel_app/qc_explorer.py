@@ -3,10 +3,12 @@
 Four tabs:
   1. Curated Products — verify CRESST curated zarr products (profiler heatmaps,
      fixed-mooring time series) with lock-on hover and full-res zoom.
-  2. Full Time Series — any stream from the ooi-data bucket (menu built from
-     rca-data-tools sitesDictionary.csv), datashaded, with a toggleable HITL
-     annotation overlay fetched live from the OOI M2M API. Zooming below
-     ~100k points in view materializes real, hoverable data points.
+  2. Full Time Series — any stream from the ooi-data bucket (menu from
+     rca-data-tools sitesDictionary.csv). Three-tier rendering: cached
+     full-range overview, windowed re-aggregation on zoom, real hoverable
+     points below ~100k in view. Toggleable overlays: HITL annotations,
+     deployment markers, QARTOD flags (suspect/fail), climatology envelope.
+     Drag an x-box-select to draft an M2M annotation payload.
   3. Time Machine — one year vs selected prior years on the same axis
      (rca-data-tools time-machine mechanic). 1D sources only: curated
      fixed-mooring products and decimated ooi-data streams.
@@ -24,9 +26,12 @@ import panel as pn
 pn.extension('tabulator', loading_spinner='dots')
 
 import os
+import ast
+import json
 import asyncio
 import traceback
 from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 from pathlib import Path
 
 import s3fs
@@ -37,6 +42,7 @@ import xarray as xr
 import holoviews as hv
 import hvplot.xarray
 import cmocean
+from holoviews.operation.datashader import rasterize
 from bokeh.models import DatetimeTickFormatter, DatetimeTicker, HoverTool
 
 try:
@@ -48,7 +54,20 @@ except ImportError:
 CURATED_PREFIX = "rca-advanced-qaqc/cresst"
 OOI_DATA_BUCKET = "ooi-data"
 ANNO_URL = "https://ooinet.oceanobservatories.org/api/m2m/12580/anno/find"
+DEPLOY_URL = "https://ooinet.oceanobservatories.org/api/m2m/12587/events/deployment/query"
 OOI_AUTH = (os.getenv("OOI_USERNAME", ""), os.getenv("OOI_TOKEN", ""))
+
+QC_LOOKUP = Path.home() / "repos/qc-lookup/qartod"
+
+# CTD refdes per curated product prefix (for deployment markers); longest match wins
+CURATED_REFDES = {
+    "axial_base_deep":      "RS03AXPD-DP03A-01-CTDPFL304",
+    "axial_base":           "RS03AXPS-SF03A-2A-CTDPFA302",
+    "slope_base_deep":      "RS01SBPD-DP01A-01-CTDPFL104",
+    "slope_base":           "RS01SBPS-SF01A-2A-CTDPFA102",
+    "oregon_offshore_deep": "CE04OSPD-DP01B-01-CTDPFL105",
+    "oregon_offshore":      "CE04OSPS-SF01B-2A-CTDPFA107",
+}
 
 PARAMS_LOCAL = Path.home() / "repos/rca-data-tools/rca_data_tools/qaqc/params"
 PARAMS_URL = "https://raw.githubusercontent.com/OOI-CabledArray/rca-data-tools/main/rca_data_tools/qaqc/params"
@@ -115,7 +134,9 @@ def discover_curated():
 
 @pn.cache
 def get_dataset(s3_path):
-    ds = xr.open_zarr(fs.get_mapper(s3_path), consolidated=True)
+    # chunks={} keeps arrays dask-backed (zarr chunking) so stream aggregation
+    # runs partition-wise instead of loading whole variables into memory
+    ds = xr.open_zarr(fs.get_mapper(s3_path), consolidated=True, chunks={})
     if "profile_number" in ds.dims:
         valid = ~np.isnat(ds.peak_time.values)
         ds = ds.isel(profile_number=valid).sortby("peak_time")
@@ -159,6 +180,82 @@ def annotation_overlay(refdes):
     )
 
 
+@pn.cache
+def fetch_deployments(refdes):
+    if not OOI_AUTH[0]:
+        raise RuntimeError("Set OOI_USERNAME and OOI_TOKEN (env or .env) for deployments")
+    resp = requests.get(DEPLOY_URL, params={"refdes": refdes}, auth=OOI_AUTH, timeout=30)
+    resp.raise_for_status()
+    return sorted(
+        (pd.Timestamp(d["eventStartTime"], unit="ms"), d["deploymentNumber"])
+        for d in resp.json() if d.get("eventStartTime")
+    )
+
+
+def deployment_overlay(refdes):
+    deps = fetch_deployments(refdes)
+    return hv.VLines(
+        ([t for t, _ in deps], [f"Deploy {n}: {t:%Y-%m-%d}" for t, n in deps]),
+        vdims=["deployment"],
+    ).opts(line_color="gray", line_dash="dashed", line_width=1, tools=["hover"])
+
+
+def curated_refdes(dataset_name):
+    for prefix, refdes in CURATED_REFDES.items():
+        if dataset_name.startswith(prefix):
+            return refdes
+    return None
+
+
+def mask_gaps(da, tdim, factor=3.0):
+    """Insert NaN columns inside sampling gaps so quadmesh cells don't
+    stretch across them and read as (false) continuous data."""
+    t = da[tdim].values
+    if t.size < 3:
+        return da
+    dt = np.diff(t)
+    med = np.median(dt)
+    gaps = np.where(dt > factor * med)[0]
+    if not gaps.size:
+        return da
+    fill = np.concatenate([t[gaps] + med, t[gaps + 1] - med])
+    return da.reindex({tdim: np.union1d(t, fill)})
+
+
+@pn.cache
+def climatology_envelope(refdes, var):
+    """Monthly (min, max) from the qc-lookup QARTOD climatology table for this
+    refdes/variable, enveloped across pressure bins. None if no table."""
+    candidates = {var, var.removeprefix("sea_water_"),
+                  var.replace("sea_water_", "seawater_"),
+                  var.replace("sea_water_electrical_", "seawater_")}
+    table = next((f for f in QC_LOOKUP.glob(f"*/climatology_tables/{refdes}-*.csv")
+                  if f.stem.removeprefix(f"{refdes}-") in candidates), None)
+    if table is None:
+        return None
+    df = pd.read_csv(table, index_col=0)
+    parsed = df.map(ast.literal_eval)  # cells are "[min, max]"
+    mins = parsed.map(lambda v: v[0]).min(axis=0).values
+    maxs = parsed.map(lambda v: v[1]).max(axis=0).values
+    return mins, maxs
+
+
+def climatology_overlay(refdes, var, t0, t1):
+    env = climatology_envelope(refdes, var)
+    if env is None:
+        return None
+    mins, maxs = env
+    starts = pd.date_range(pd.Timestamp(t0).to_period("M").to_timestamp(), t1, freq="MS")
+    xs, lo, hi = [], [], []
+    for s in starts:
+        e = s + pd.offsets.MonthBegin(1)
+        xs += [s, e]
+        lo += [mins[s.month - 1]] * 2
+        hi += [maxs[s.month - 1]] * 2
+    return hv.Area((xs, lo, hi), vdims=["low", "high"]).opts(
+        fill_color="seagreen", fill_alpha=0.15, line_alpha=0)
+
+
 # --- Plot builders ---
 def heatmap(da, tdim, style, cmap_name):
     label = style["label"]
@@ -194,35 +291,103 @@ def _to_timestamp(v):
     return pd.Timestamp(v, unit="ms") if isinstance(v, (int, float)) else pd.Timestamp(v)
 
 
-def detail_layer(da, style):
-    """Real, hoverable points that appear once the zoom window holds fewer
-    than DETAIL_THRESHOLD samples; empty above that so cost stays bounded."""
-    idx = da.indexes["time"]
-    label = style["label"]
+# --- Stream rendering: cached full-range overview + windowed re-aggregation.
+# The expensive full scan happens once per (refdes, var, flag) in a worker
+# thread; pan/zoom at coarse level redraws the cached image instantly, mid
+# zooms re-aggregate only the visible window (index-pruned S3 reads), and
+# below DETAIL_THRESHOLD real hoverable points appear.
+MID_CAP = 10_000_000  # max points to window-aggregate on the fly
+
+STREAM_LAYERS = {  # QARTOD rollup flag value -> image style
+    None: dict(cmap="kbc_r", cnorm="eq_hist"),
+    "3":  dict(cmap=["#ff8c00"]),
+    "4":  dict(cmap=["#d62728"]),
+}
+
+
+def _stream_path(refdes):
+    return f"{OOI_DATA_BUCKET}/{SITES_DICT[refdes]['zarr']}"
+
+
+def flag_col(ds, var):
+    col = f"{var}_qartod_results"
+    return col if col in ds else None
+
+
+def _rasterize(data, var, x_range=None, y_range=None):
+    el = hv.Scatter(data, "time", var)
+    return rasterize(el, x_range=x_range, y_range=y_range, dynamic=False,
+                     width=1200, height=400)
+
+
+@pn.cache(max_items=12, policy="LRU")
+def stream_overview(refdes, var, flag):
+    ds = get_dataset(_stream_path(refdes))
+    fcol = flag_col(ds, var)
+    ddf = ds[[var] + ([fcol] if fcol else [])].unify_chunks().to_dask_dataframe()
+    if flag:
+        ddf = ddf[ddf[fcol].astype(str).str.strip() == flag]
+    return _rasterize(ddf, var)
+
+
+@lru_cache(maxsize=4)
+def load_slice(refdes, var, lo, hi):
+    ds = get_dataset(_stream_path(refdes))
+    fcol = flag_col(ds, var)
+    return ds[[var] + ([fcol] if fcol else [])].isel(time=slice(lo, hi)).load() \
+        .to_dataframe().reset_index()
+
+
+def stream_layer(refdes, var, flag, label):
+    ds = get_dataset(_stream_path(refdes))
+    idx, fcol = ds.indexes["time"], flag_col(ds, var)
+    hover = HoverTool(
+        tooltips=[("time", "$x{%F %H:%M}"), (label, "$y{0.000}"), ("count", "@image")],
+        formatters={"$x": "datetime"},
+    )
+    opts = dict(nodata=0, xlabel="Time", ylabel=label,
+                tools=[hover] if flag is None else [], **STREAM_LAYERS[flag])
+
+    def view(x_range, y_range):
+        if x_range is not None:
+            lo = idx.searchsorted(_to_timestamp(x_range[0]))
+            hi = idx.searchsorted(_to_timestamp(x_range[1]))
+            if hi - lo <= MID_CAP:
+                df = load_slice(refdes, var, int(lo), int(hi))
+                if flag:
+                    df = df[df[fcol].astype(str).str.strip() == flag]
+                xr_ = tuple(np.datetime64(_to_timestamp(v)) for v in x_range)
+                yr_ = tuple(y_range) if y_range is not None else None
+                if len(df):
+                    return _rasterize(df, var, x_range=xr_, y_range=yr_).opts(**opts)
+                y0, y1 = yr_ or (0.0, 1.0)
+                return hv.Image(([xr_[0], xr_[1]], [y0, y1],
+                                 np.full((2, 2), np.nan)), ["time", var]).opts(**opts)
+        return stream_overview(refdes, var, flag).opts(**opts)
+
+    return hv.DynamicMap(view, streams=[hv.streams.RangeXY()])
+
+
+def detail_layer(refdes, var, label):
+    """Real, hoverable points once the window holds < DETAIL_THRESHOLD samples."""
+    idx = get_dataset(_stream_path(refdes)).indexes["time"]
     hover = HoverTool(
         tooltips=[("time", "@time{%F %H:%M:%S}"), (label, "@value")],
         formatters={"@time": "datetime"},
     )
 
     def points(x_range, y_range):
-        sl = da.isel(time=slice(0, 0))
+        data = ([], [])
         if x_range is not None:
             lo = idx.searchsorted(_to_timestamp(x_range[0]))
             hi = idx.searchsorted(_to_timestamp(x_range[1]))
             if 0 < hi - lo <= DETAIL_THRESHOLD:
-                sl = da.isel(time=slice(lo, hi)).load()
-        return hv.Scatter((sl["time"].values, sl.values), "time", "value").opts(
+                df = load_slice(refdes, var, int(lo), int(hi))
+                data = (df["time"].values, df[var].values)
+        return hv.Scatter(data, "time", "value").opts(
             color="crimson", size=5, tools=[hover])
 
     return hv.DynamicMap(points, streams=[hv.streams.RangeXY()])
-
-
-def stream_plot(da, style, ylim):
-    shaded = da.hvplot.scatter(
-        x="time", datashade=True, xlabel="Time", ylabel=style["label"],
-        ylim=ylim, grid=True, min_height=350, responsive=True,
-    )
-    return (shaded * detail_layer(da, style)).opts(shared_axes=False, **DATETIME_OPTS)
 
 
 # --- Panel scaffolding ---
@@ -282,10 +447,15 @@ class CuratedPanel(PanelBase):
             name="Dataset", options=["-- Select --"] + list(datasets), width=480)
         self.var_select = pn.widgets.Select(name="Variable", options=[], width=260)
         self.cmap_select = pn.widgets.Select(name="Colormap", options=CMAP_OPTIONS, width=130)
+        self.mask_toggle = pn.widgets.Checkbox(name="Mask gaps", value=True)
+        self.deploy_toggle = pn.widgets.Checkbox(name="Deployments", value=False)
         self.dataset_select.param.watch(self._dataset_changed, "value")
         self.var_select.param.watch(self._var_changed, "value")
-        self.cmap_select.param.watch(lambda e: self.run(self._build, apply=self._show), "value")
-        self.layout = self.build_layout(self.dataset_select, self.var_select, self.cmap_select)
+        for w in (self.cmap_select, self.mask_toggle, self.deploy_toggle):
+            w.param.watch(lambda e: self.run(self._build, apply=self._show), "value")
+        self.layout = self.build_layout(
+            self.dataset_select, self.var_select, self.cmap_select,
+            self.mask_toggle, self.deploy_toggle)
 
     def _dataset_changed(self, event):
         datasets = discover_curated()
@@ -310,26 +480,39 @@ class CuratedPanel(PanelBase):
 
     def _build(self):
         datasets = discover_curated()
-        if self.dataset_select.value not in datasets or not self.var_select.value:
+        name = self.dataset_select.value
+        if name not in datasets or not self.var_select.value:
             return None
         var = self.var_select.value
-        da = load_var(datasets[self.dataset_select.value], var)
+        da = load_var(datasets[name], var)
         style = var_style(var)
         tdim = time_dim(da)
         if da.ndim == 2:
-            return heatmap(da, tdim, style, self.cmap_select.value), True
-        return scatter_1d(da, tdim, style), False
+            if self.mask_toggle.value:
+                da = mask_gaps(da, tdim)
+            plot, is_2d = heatmap(da, tdim, style, self.cmap_select.value), True
+        else:
+            plot, is_2d = scatter_1d(da, tdim, style), False
+        refdes = curated_refdes(name)
+        if self.deploy_toggle.value and refdes:
+            plot = plot * deployment_overlay(refdes)
+        return plot, is_2d
 
     def _show(self, result):
         if result is None:
             return
         plot, is_2d = result
         self.cmap_select.disabled = not is_2d
+        self.mask_toggle.disabled = not is_2d
         self.plot_pane.object = plot
 
 
+QC_FLAG_OPTIONS = ["suspect", "fail", "not_operational", "not_available", "pass"]
+
+
 class StreamPanel(PanelBase):
-    """Tab 2: full-resolution ooi-data stream + annotation overlay."""
+    """Tab 2: full-resolution ooi-data stream with QARTOD flag, climatology,
+    annotation, and deployment overlays, plus an annotation drafting tool."""
 
     def __init__(self, on_remove):
         super().__init__(on_remove)
@@ -339,17 +522,72 @@ class StreamPanel(PanelBase):
         self.refdes_select = pn.widgets.Select(
             name="Instrument", groups={"": ["-- Select --"], **groups}, width=340)
         self.var_select = pn.widgets.Select(name="Variable", options=[], width=280)
-        self.anno_toggle = pn.widgets.Checkbox(name="Annotations", value=False)
         self.yrange_radio = pn.widgets.RadioButtonGroup(
             options=["Auto", "Standard"], value="Auto", width=150)
+        self.anno_toggle = pn.widgets.Checkbox(name="Annotations", value=False)
+        self.deploy_toggle = pn.widgets.Checkbox(name="Deployments", value=True)
+        self.flags_toggle = pn.widgets.Checkbox(name="QARTOD flags", value=False)
+        self.clim_toggle = pn.widgets.Checkbox(name="Climatology", value=False)
         self.info_pane = pn.pane.Alert("", alert_type="primary", visible=False)
-        self.refdes_select.param.watch(self._refdes_changed, "value")
-        for w in (self.var_select, self.anno_toggle, self.yrange_radio):
-            w.param.watch(lambda e: self._plot(), "value")
-        self.layout = self.build_layout(
-            self.refdes_select, self.var_select, self.yrange_radio, self.anno_toggle)
-        self.layout.insert(1, self.info_pane)
 
+        self.refdes_select.param.watch(self._refdes_changed, "value")
+        for w in (self.var_select, self.yrange_radio, self.anno_toggle,
+                  self.deploy_toggle, self.flags_toggle, self.clim_toggle):
+            w.param.watch(lambda e: self._plot(), "value")
+
+        self._init_draft()
+        self.layout = self.build_layout(
+            self.refdes_select, self.var_select, self.yrange_radio)
+        self.layout.insert(1, pn.Row(self.anno_toggle, self.deploy_toggle,
+                                     self.flags_toggle, self.clim_toggle))
+        self.layout.insert(2, self.info_pane)
+        self.layout.append(self.draft_card)
+
+    # -- annotation drafting --
+    def _init_draft(self):
+        self.draft_begin = pn.widgets.DatetimePicker(name="Begin", width=200)
+        self.draft_end = pn.widgets.DatetimePicker(name="End", width=200)
+        self.draft_flag = pn.widgets.Select(
+            name="qcFlag", options=QC_FLAG_OPTIONS, value="suspect", width=150)
+        self.draft_text = pn.widgets.TextAreaInput(
+            name="Annotation", rows=3, width=620, placeholder="Describe the problem…")
+        self.draft_json = pn.widgets.TextAreaInput(
+            name="M2M payload (copy/paste)", rows=8, width=620, disabled=True)
+        for w in (self.draft_begin, self.draft_end, self.draft_flag, self.draft_text):
+            w.param.watch(lambda e: self._update_draft(), "value")
+        self.draft_card = pn.Card(
+            pn.Row(self.draft_begin, self.draft_end, self.draft_flag),
+            self.draft_text, self.draft_json,
+            title="Draft annotation — drag an x-box-select on the plot to set the time range",
+            collapsed=True, sizing_mode="stretch_width")
+        self.bounds_stream = None
+
+    def _bounds_changed(self, event):
+        if event.new is None:
+            return
+        x0, x1 = event.new
+        self.draft_begin.value = _to_timestamp(x0).to_pydatetime()
+        self.draft_end.value = _to_timestamp(x1).to_pydatetime()
+        self.draft_card.collapsed = False
+
+    def _update_draft(self):
+        refdes = self.refdes_select.value
+        if refdes not in SITES_DICT or not self.draft_begin.value:
+            return
+        subsite, node, sensor = refdes.split("-", 2)
+        method, stream = SITES_DICT[refdes]["zarr"].removeprefix(f"{refdes}-").split("-", 1)
+        payload = {
+            "subsite": subsite, "node": node, "sensor": sensor,
+            "method": method, "stream": stream,
+            "beginDT": int(pd.Timestamp(self.draft_begin.value).timestamp() * 1000),
+            "endDT": int(pd.Timestamp(self.draft_end.value).timestamp() * 1000) if self.draft_end.value else None,
+            "annotation": self.draft_text.value,
+            "qcFlag": self.draft_flag.value,
+            "source": OOI_AUTH[0],
+        }
+        self.draft_json.value = json.dumps(payload, indent=2)
+
+    # -- data/plot --
     def _refdes_changed(self, event):
         if event.new not in SITES_DICT:
             self.var_select.options = []
@@ -372,24 +610,58 @@ class StreamPanel(PanelBase):
         var = self.var_select.value
 
         def build():
-            ds = get_dataset(f"{OOI_DATA_BUCKET}/{SITES_DICT[refdes]['zarr']}")
+            ds = get_dataset(_stream_path(refdes))
             style = var_style(var)
+            label = style["label"]
             ylim = style["ylim"] if self.yrange_radio.value == "Standard" else None
-            plot = stream_plot(ds[var], style, ylim)
-            if self.anno_toggle.value:
-                plot = plot * annotation_overlay(refdes)
-            return plot, ds[var].sizes["time"]
+            notes = []
+            has_flags = flag_col(ds, var) is not None
+            flags = [None] + (["3", "4"] if self.flags_toggle.value and has_flags else [])
+            if self.flags_toggle.value and not has_flags:
+                notes.append("no QARTOD results variable for this parameter")
+            for f in flags:  # warm the overview cache here, off the event loop
+                stream_overview(refdes, var, f)
+            main = stream_layer(refdes, var, None, label)
+            plot = main
+            for f in flags[1:]:
+                plot = plot * stream_layer(refdes, var, f, label)
+            plot = plot * detail_layer(refdes, var, label)
+            if self.clim_toggle.value:
+                idx = ds.indexes["time"]
+                band = climatology_overlay(refdes, var, idx[0], idx[-1])
+                if band is not None:
+                    plot = band * plot
+                else:
+                    notes.append("no climatology table found in qc-lookup")
+            for enabled, fn, name in [(self.anno_toggle.value, annotation_overlay, "annotations"),
+                                      (self.deploy_toggle.value, deployment_overlay, "deployments")]:
+                if enabled:
+                    try:
+                        plot = plot * fn(refdes)
+                    except Exception as e:
+                        notes.append(f"{name} unavailable: {e}")
+            plot = plot.opts(shared_axes=False, responsive=True, min_height=450, **DATETIME_OPTS)
+            if ylim:
+                plot = plot.opts(ylim=ylim)
+            return plot, main, ds[var].sizes["time"], notes
 
         def show(result):
-            plot, n = result
-            note = f"**{n/1e6:.0f}M points** — zoom below {DETAIL_THRESHOLD:,} points in view for value hover."
-            if n > BIG_STREAM:
-                note += " Large stream: full-range rendering scans every chunk from S3 and can take minutes."
+            plot, main, n, notes = result
+            self.bounds_stream = hv.streams.BoundsX(source=main)
+            self.bounds_stream.param.watch(self._bounds_changed, "boundsx")
+            note = (f"**{n/1e6:.0f}M points** — zoom below {DETAIL_THRESHOLD:,} "
+                    "points in view for value hover.")
+            if notes:
+                note += " ⚠ " + "; ".join(notes)
             self.info_pane.object = note
+            self.info_pane.alert_type = "warning" if notes else "primary"
             self.info_pane.visible = True
             self.plot_pane.object = plot
 
-        self.info_pane.object = "Loading stream from S3 — large datasets can take a while on first render…"
+        self.info_pane.object = ("Aggregating stream — the first full-range view of a large "
+                                 "dataset scans every chunk from S3 and can take minutes; "
+                                 "it is cached afterwards…")
+        self.info_pane.alert_type = "primary"
         self.info_pane.visible = True
         self.run(build, apply=show)
 

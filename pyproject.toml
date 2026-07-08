@@ -12,6 +12,7 @@ dependencies = [
     "hvplot",
     "holoviews",
     "datashader",
+    "dask[dataframe]",
     "bokeh",
     "xarray",
     "zarr",
