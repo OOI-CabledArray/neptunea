@@ -525,7 +525,7 @@ class StreamPanel(PanelBase):
             name="Instrument", groups={"": ["-- Select --"], **groups}, width=340)
         self.var_select = pn.widgets.Select(name="Variable", options=[], width=280)
         self.yrange_radio = pn.widgets.RadioButtonGroup(
-            options=["Auto", "Standard"], value="Auto", width=150)
+            options=["Standard", "Auto"], value="Standard", width=150)
         self.anno_toggle = pn.widgets.Checkbox(name="Annotations", value=False)
         self.deploy_toggle = pn.widgets.Checkbox(name="Deployments", value=True)
         self.flags_toggle = pn.widgets.Checkbox(name="QARTOD flags", value=False)
@@ -617,6 +617,8 @@ class StreamPanel(PanelBase):
             label = style["label"]
             ylim = style["ylim"] if self.yrange_radio.value == "Standard" else None
             notes = []
+            if self.yrange_radio.value == "Standard" and not style["ylim"]:
+                notes.append("no standard range for this parameter (using auto)")
             has_flags = flag_col(ds, var) is not None
             flags = [None] + (["3", "4"] if self.flags_toggle.value and has_flags else [])
             if self.flags_toggle.value and not has_flags:
