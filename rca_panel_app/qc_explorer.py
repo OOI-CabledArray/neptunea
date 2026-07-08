@@ -5,10 +5,10 @@ Four tabs:
      fixed-mooring time series) with lock-on hover and full-res zoom.
   2. Full Time Series — any stream from the ooi-data bucket (menu from
      rca-data-tools sitesDictionary.csv). Three-tier rendering: cached
-     full-range overview, windowed re-aggregation on zoom, real hoverable
-     points below ~100k in view. Toggleable overlays: HITL annotations,
-     deployment markers, QARTOD flags (suspect/fail), climatology envelope.
-     Drag an x-box-select to draft an M2M annotation payload.
+     full-range overview, windowed re-aggregation on zoom, individual
+     points once sparse. Hover works at every zoom level. Toggleable
+     overlays: HITL annotations, deployment markers, QARTOD flags,
+     climatology envelope. Drag an x-box-select to draft an M2M annotation.
   3. Time Machine — one year vs selected prior years on the same axis
      (rca-data-tools time-machine mechanic). 1D sources only: curated
      fixed-mooring products and decimated ooi-data streams.
@@ -83,7 +83,9 @@ TM_COLORS = ["#1f78b4", "#a6cee3", "#b2df8a", "#33a02c", "#fb9a99", "#e31a1c",
 
 fs = s3fs.S3FileSystem(anon=False)
 EXECUTOR = ThreadPoolExecutor(max_workers=4)
-DETAIL_THRESHOLD = 100_000  # max points to materialize for hoverable zoom detail
+# The rasterized image carries hover (time / value / count) at every zoom
+# level; individual points are only drawn once sparse enough to distinguish.
+DETAIL_THRESHOLD = 2_000
 BIG_STREAM = 50_000_000     # warn above this many points
 
 
@@ -649,8 +651,8 @@ class StreamPanel(PanelBase):
             plot, main, n, notes = result
             self.bounds_stream = hv.streams.BoundsX(source=main)
             self.bounds_stream.param.watch(self._bounds_changed, "boundsx")
-            note = (f"**{n/1e6:.0f}M points** — zoom below {DETAIL_THRESHOLD:,} "
-                    "points in view for value hover.")
+            note = (f"**{n/1e6:.0f}M points** — hover reads binned value/count at any zoom; "
+                    f"individual points draw below {DETAIL_THRESHOLD:,} in view.")
             if notes:
                 note += " ⚠ " + "; ".join(notes)
             self.info_pane.object = note
