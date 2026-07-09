@@ -309,7 +309,7 @@ def scatter_1d(da, tdim, style):
         formatters={f"@{tdim}": "datetime"},
     )
     return da.hvplot.scatter(
-        x=tdim, xlabel="Time", ylabel=label, size=4, grid=True,
+        x=tdim, xlabel="Time", ylabel=label, size=2, grid=True,
         min_height=300, responsive=True,
     ).opts(tools=[hover], shared_axes=False, **DATETIME_OPTS)
 
