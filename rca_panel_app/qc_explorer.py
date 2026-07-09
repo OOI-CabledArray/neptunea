@@ -13,6 +13,8 @@ Four tabs:
      (rca-data-tools time-machine mechanic). 1D sources only: curated
      fixed-mooring products and decimated ooi-data streams.
   4. Annotations — searchable HITL annotation table per reference designator.
+  5. Metadata — xarray's notebook-style HTML repr (dims, coords, variables,
+     attrs, chunking) for any curated store or ooi-data stream.
 
 Plot standards (colormaps, ranges, labels) come from rca-data-tools
 params/variableParameters.csv; heatmaps use profileMin/profileMax, 1D uses
@@ -829,6 +831,36 @@ class AnnotationBrowser:
             self.error_pane.visible = True
 
 
+class MetadataPanel(PanelBase):
+    """Tab 5: xarray's rich HTML repr for any curated store or ooi-data stream
+    (the same collapsible view a Dataset shows in a Jupyter notebook)."""
+
+    def __init__(self):
+        super().__init__(on_remove=lambda p: None)
+        self.remove_btn.visible = False
+        # PanelBase.run() targets plot_pane; an HTML pane has the same
+        # object/loading interface, so it slots straight in.
+        self.plot_pane = pn.pane.HTML(None, sizing_mode="stretch_width")
+        self.source_select = pn.widgets.Select(
+            name="Dataset", width=520,
+            groups={"": ["-- Select --"],
+                    "Curated (cresst)": list(discover_curated()),
+                    "OOI streams": list(SITES_DICT)})
+        self.source_select.param.watch(self._changed, "value")
+        self.layout = self.build_layout(self.source_select)
+
+    def _changed(self, event):
+        curated = discover_curated()
+        if event.new in curated:
+            path = curated[event.new]
+        elif event.new in SITES_DICT:
+            path = _stream_path(event.new)
+        else:
+            self.plot_pane.object = None
+            return
+        self.run(lambda: get_dataset(path)._repr_html_())
+
+
 def multi_panel_tab(panel_cls):
     """Column of removable panels with an add button."""
     column = pn.Column(sizing_mode="stretch_width")
@@ -845,6 +877,7 @@ tabs = pn.Tabs(
     ("Full Time Series", multi_panel_tab(StreamPanel)),
     ("Time Machine", TimeMachinePanel().layout),
     ("Annotations", AnnotationBrowser().layout),
+    ("Metadata", MetadataPanel().layout),
     dynamic=True,
     sizing_mode="stretch_width",
 )
