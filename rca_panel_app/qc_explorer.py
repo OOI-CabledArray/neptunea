@@ -30,6 +30,7 @@ pn.extension('tabulator', loading_spinner='dots')
 import os
 import ast
 import json
+import datetime
 import asyncio
 import traceback
 from concurrent.futures import ThreadPoolExecutor
@@ -726,12 +727,26 @@ class TimeMachinePanel(PanelBase):
         self.year_select = pn.widgets.Select(name="Year", options=[], width=100)
         self.compare_select = pn.widgets.MultiChoice(
             name="Compare with", options=[], width=320)
+        # Month-day window applied to every overlaid year; the year component
+        # tracks the reference year. Default full-year = original behavior.
+        self.win_start = pn.widgets.DatePicker(name="Window start", width=170)
+        self.win_end = pn.widgets.DatePicker(name="Window end", width=170)
+        self.full_year_btn = pn.widgets.Button(name="Full year", width=90)
+        self.invert_toggle = pn.widgets.Checkbox(name="Invert y-axis", value=False)
+        self.size_slider = pn.widgets.DiscreteSlider(
+            name="Point size", options=[0.25, 0.5, 1, 2, 3, 4, 6, 8, 10], value=3, width=170)
+        self._suppress = False
         self.dataset_select.param.watch(self._dataset_changed, "value")
         self.var_select.param.watch(lambda e: self._years_then_plot(), "value")
-        for w in (self.year_select, self.compare_select):
-            w.param.watch(lambda e: self.run(self._build), "value")
+        self.year_select.param.watch(self._year_changed, "value")
+        for w in (self.compare_select, self.win_start, self.win_end,
+                  self.invert_toggle, self.size_slider):
+            w.param.watch(lambda e: self._rebuild(), "value")
+        self.full_year_btn.on_click(lambda e: self._reset_window())
         self.layout = self.build_layout(
             self.dataset_select, self.var_select, self.year_select, self.compare_select)
+        self.layout.insert(1, pn.Row(self.win_start, self.win_end, self.full_year_btn,
+                                     self.invert_toggle, self.size_slider, align="center"))
 
     def _open(self):
         kind, key = self.sources[self.dataset_select.value]
@@ -756,17 +771,55 @@ class TimeMachinePanel(PanelBase):
     def _years_then_plot(self):
         if not self.var_select.value:
             return
-        def set_years(years):
+        def set_years(payload):
+            years, ref = payload
+            self._suppress = True
             self.year_select.options = years
             self.compare_select.options = years
-            if self.year_select.value == years[0]:
-                self.run(self._build)  # watcher won't fire on same value
-            else:
-                self.year_select.value = years[0]
+            self.year_select.value = ref
+            # default: reference = last full year only; user adds comparisons
+            self.compare_select.value = []
+            self._remap_window(ref)
+            self._suppress = False
+            self.run(self._build)
         def go():
             idx = self._open()[2].indexes["time"]
-            return list(range(idx[-1].year, idx[0].year - 1, -1))
+            years = list(range(idx[-1].year, idx[0].year - 1, -1))
+            last = idx[-1]
+            # a year is "full" if data reaches ~mid-December; else step back one
+            ref = last.year if last.dayofyear >= 350 else last.year - 1
+            return years, (ref if ref in years else years[0])
         self.run(go, apply=set_years)
+
+    def _remap_window(self, year):
+        """Point the window pickers at `year`, keeping month/day; default to
+        the full year. Callers hold self._suppress."""
+        for pk, default in ((self.win_start, (1, 1)), (self.win_end, (12, 31))):
+            m, d = (pk.value.month, pk.value.day) if pk.value else default
+            pk.start = datetime.date(year, 1, 1)
+            pk.end = datetime.date(year, 12, 31)
+            pk.value = datetime.date(year, m, d)
+
+    def _year_changed(self, event):
+        if self._suppress or event.new is None:
+            return
+        self._suppress = True
+        self._remap_window(event.new)
+        self._suppress = False
+        self.run(self._build)
+
+    def _rebuild(self):
+        if not self._suppress:
+            self.run(self._build)
+
+    def _reset_window(self):
+        if self.year_select.value is None:
+            return
+        self._suppress = True
+        self.win_start.value = datetime.date(self.year_select.value, 1, 1)
+        self.win_end.value = datetime.date(self.year_select.value, 12, 31)
+        self._suppress = False
+        self.run(self._build)
 
     def _build(self):
         ref = self.year_select.value
@@ -775,24 +828,33 @@ class TimeMachinePanel(PanelBase):
         kind, key = self.sources[self.dataset_select.value]
         var = self.var_select.value
         style = var_style(var)
+        ws, we = self.win_start.value, self.win_end.value
         curves = []
         compare = [y for y in self.compare_select.value if y != ref]
         for yr in [ref] + sorted(compare, reverse=True):
             sl = load_year(kind, key, var, yr).dropna("time")
+            if ws and we:  # restrict each year to the month-day window
+                try:
+                    lo = pd.Timestamp(year=yr, month=ws.month, day=ws.day)
+                    hi = pd.Timestamp(year=yr, month=we.month, day=we.day) + pd.Timedelta(days=1)
+                except ValueError:
+                    continue
+                sl = sl.sel(time=slice(lo, hi))
             if not sl.time.size:
                 continue
             # rca-data-tools mechanic: slide prior years forward onto the ref-year axis
             shifted = sl.assign_coords(time=sl.time + np.timedelta64((ref - yr) * 365, "D"))
             color = TM_COLORS[(ref - yr) % len(TM_COLORS)]
             curves.append(shifted.hvplot.scatter(
-                x="time", size=3, color=color, label=str(yr),
+                x="time", size=self.size_slider.value, color=color, label=str(yr),
                 xlabel=f"Time ({ref})", ylabel=style["label"],
                 min_height=400, responsive=True,
             ))
         if not curves:
             return None
         return hv.Overlay(curves).opts(
-            shared_axes=False, legend_position="top_right", **DATETIME_OPTS)
+            shared_axes=False, legend_position="top_right", padding=(0, 0.1),
+            invert_yaxis=self.invert_toggle.value, **DATETIME_OPTS)
 
 
 class AnnotationBrowser:
