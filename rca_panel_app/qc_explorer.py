@@ -327,9 +327,13 @@ def _to_timestamp(v):
 # zooms re-aggregate only the visible window (index-pruned S3 reads), and
 # below DETAIL_THRESHOLD real hoverable points appear.
 # Windows above MID_CAP fall back to the cached overview image; below it the
-# read is strided down to TARGET_POINTS — all a 1200px raster can resolve.
-MID_CAP = 4_000_000
+# read is strided down to TARGET_POINTS — all a detail raster can resolve.
+# MID_CAP ~= one 1 Hz deployment-year, so a single deployment re-aggregates to
+# a true windowed read (a few chunks, parallel fetch); wider views ride the
+# overview, rasterized extra-wide so cropping to a sub-span stays sharp.
+MID_CAP = 40_000_000
 TARGET_POINTS = 400_000
+OVERVIEW_WIDTH = 6000
 
 STREAM_LAYERS = {  # QARTOD rollup flag value -> image style
     None: dict(cmap="kbc_r", cnorm="eq_hist"),
@@ -347,10 +351,10 @@ def flag_col(ds, var):
     return col if col in ds else None
 
 
-def _rasterize(data, var, x_range=None, y_range=None):
+def _rasterize(data, var, x_range=None, y_range=None, width=1200):
     el = hv.Scatter(data, "time", var)
     return rasterize(el, x_range=x_range, y_range=y_range, dynamic=False,
-                     width=1200, height=400)
+                     width=width, height=400)
 
 
 @pn.cache(max_items=12, policy="LRU")
@@ -360,7 +364,7 @@ def stream_overview(refdes, var, flag):
     ddf = ds[[var] + ([fcol] if fcol else [])].unify_chunks().to_dask_dataframe()
     if flag:
         ddf = ddf[ddf[fcol].astype(str).str.strip() == flag]
-    return _rasterize(ddf, var)
+    return _rasterize(ddf, var, width=OVERVIEW_WIDTH)
 
 
 @lru_cache(maxsize=8)
