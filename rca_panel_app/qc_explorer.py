@@ -326,7 +326,10 @@ def _to_timestamp(v):
 # thread; pan/zoom at coarse level redraws the cached image instantly, mid
 # zooms re-aggregate only the visible window (index-pruned S3 reads), and
 # below DETAIL_THRESHOLD real hoverable points appear.
-MID_CAP = 10_000_000  # max points to window-aggregate on the fly
+# Windows above MID_CAP fall back to the cached overview image; below it the
+# read is strided down to TARGET_POINTS — all a 1200px raster can resolve.
+MID_CAP = 4_000_000
+TARGET_POINTS = 400_000
 
 STREAM_LAYERS = {  # QARTOD rollup flag value -> image style
     None: dict(cmap="kbc_r", cnorm="eq_hist"),
@@ -360,11 +363,11 @@ def stream_overview(refdes, var, flag):
     return _rasterize(ddf, var)
 
 
-@lru_cache(maxsize=4)
-def load_slice(refdes, var, lo, hi):
+@lru_cache(maxsize=8)
+def load_slice(refdes, var, lo, hi, stride):
     ds = get_dataset(_stream_path(refdes))
     fcol = flag_col(ds, var)
-    return ds[[var] + ([fcol] if fcol else [])].isel(time=slice(lo, hi)).load() \
+    return ds[[var] + ([fcol] if fcol else [])].isel(time=slice(lo, hi, stride)).load() \
         .to_dataframe().reset_index()
 
 
@@ -382,8 +385,10 @@ def stream_layer(refdes, var, flag, label):
         if x_range is not None:
             lo = idx.searchsorted(_to_timestamp(x_range[0]))
             hi = idx.searchsorted(_to_timestamp(x_range[1]))
-            if hi - lo <= MID_CAP:
-                df = load_slice(refdes, var, int(lo), int(hi))
+            n = int(hi - lo)
+            if n <= MID_CAP:
+                stride = max(1, n // TARGET_POINTS)  # cap the S3 read per zoom
+                df = load_slice(refdes, var, int(lo), int(hi), stride)
                 if flag:
                     df = df[df[fcol].astype(str).str.strip() == flag]
                 xr_ = tuple(np.datetime64(_to_timestamp(v)) for v in x_range)
@@ -412,7 +417,7 @@ def detail_layer(refdes, var, label):
             lo = idx.searchsorted(_to_timestamp(x_range[0]))
             hi = idx.searchsorted(_to_timestamp(x_range[1]))
             if 0 < hi - lo <= DETAIL_THRESHOLD:
-                df = load_slice(refdes, var, int(lo), int(hi))
+                df = load_slice(refdes, var, int(lo), int(hi), 1)  # true points
                 data = (df["time"].values, df[var].values)
         return hv.Scatter(data, "time", "value").opts(
             color="crimson", size=5, tools=[hover])
@@ -559,6 +564,12 @@ class StreamPanel(PanelBase):
         self.flags_toggle = pn.widgets.Checkbox(name="QARTOD flags", value=False)
         self.clim_toggle = pn.widgets.Checkbox(name="Climatology", value=False)
         self.info_pane = pn.pane.Alert("", alert_type="primary", visible=False)
+        # zoom re-aggregation runs in the RangeXY callback (not run()); mirror
+        # the server-busy flag so a spinner marks "thinking" vs. "stuck".
+        self.zoom_busy = pn.indicators.LoadingSpinner(
+            value=False, size=22, color="warning", name="re-aggregating…",
+            visible=False)
+        pn.state.param.watch(self._busy_changed, "busy")
 
         self.refdes_select.param.watch(self._refdes_changed, "value")
         for w in (self.var_select, self.yrange_radio, self.anno_toggle,
@@ -567,11 +578,14 @@ class StreamPanel(PanelBase):
 
         self._init_draft()
         self.layout = self.build_layout(
-            self.refdes_select, self.var_select, self.yrange_radio)
+            self.refdes_select, self.var_select, self.yrange_radio, self.zoom_busy)
         self.layout.insert(1, pn.Row(self.anno_toggle, self.deploy_toggle,
                                      self.flags_toggle, self.clim_toggle))
         self.layout.insert(2, self.info_pane)
         self.layout.append(self.draft_card)
+
+    def _busy_changed(self, event):
+        self.zoom_busy.value = self.zoom_busy.visible = event.new
 
     # -- annotation drafting --
     def _init_draft(self):
