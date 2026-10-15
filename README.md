@@ -8,7 +8,9 @@ Companion to [rca-data-tools](https://github.com/OOI-CabledArray/rca-data-tools)
 
 - **Curated Products** — CRESST zarr products as heatmaps (profilers) or time
   series (fixed moorings). Hover, cmocean colormap selector, gap masking,
-  deployment markers, side-by-side comparison panels.
+  deployment markers, side-by-side comparison panels. Heatmap color range:
+  drag or type the min/max, reset to the params standard, or fit to the
+  2–98th percentile of the zoomed view — all without losing zoom.
 - **Full Time Series** — any `ooi-data` stream at native resolution. Hover at
   every zoom level; cached overview → windowed re-aggregation → points once
   sparse. Overlays: annotations, deployments, QARTOD flags, climatology.
@@ -31,7 +33,7 @@ annotation/deployment features.
 
 - Plot standards come from rca-data-tools `params/` (local checkout, else
   GitHub raw); climatology from `~/repos/qc-lookup` QARTOD tables.
-- Caching: curated variables load into memory; stream overviews cached per
+- Caching: annotations refresh every 10 min; curated variables load into memory; stream overviews cached per
   instrument/variable/flag after one full scan (~2 min, off the event loop).
 - Time machine shifts prior years by 365-day multiples (~1 day leap drift
   per 4 years, faithful to rca-data-tools).

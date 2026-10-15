@@ -1,8 +1,9 @@
 """RCA QC Explorer — interactive companion to the rca-data-tools QAQC pipeline.
 
-Four tabs:
+Five tabs:
   1. Curated Products — verify CRESST curated zarr products (profiler heatmaps,
      fixed-mooring time series) with lock-on hover and full-res zoom.
+     Heatmap color range is adjustable live (drag/type, standard, fit to view).
   2. Full Time Series — any stream from the ooi-data bucket (menu from
      rca-data-tools sitesDictionary.csv). Three-tier rendering: cached
      full-range overview, windowed re-aggregation on zoom, individual
@@ -34,7 +35,7 @@ import datetime
 import asyncio
 import traceback
 from concurrent.futures import ThreadPoolExecutor
-from functools import lru_cache
+from functools import lru_cache, partial
 from pathlib import Path
 
 import s3fs
@@ -43,7 +44,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 import holoviews as hv
-import hvplot.xarray
+import hvplot.xarray  # noqa: F401  (registers .hvplot)
 import cmocean
 from holoviews.operation.datashader import rasterize
 from bokeh.models import DatetimeTickFormatter, DatetimeTicker, HoverTool
@@ -89,7 +90,6 @@ EXECUTOR = ThreadPoolExecutor(max_workers=4)
 # The rasterized image carries hover (time / value / count) at every zoom
 # level; individual points are only drawn once sparse enough to distinguish.
 DETAIL_THRESHOLD = 2_000
-BIG_STREAM = 50_000_000     # warn above this many points
 
 
 # --- Plot standards from rca-data-tools params ---
@@ -126,8 +126,26 @@ def var_style(var):
         cmap=r.colorMap,
         clim=(float(r.profileMin), float(r.profileMax)),
         ylim=(float(r["min"]), float(r["max"])),
-        label=f"{param} ({r.label})",
+        label=f"{param} ({r.label})" if pd.notna(r.label) else param,
     )
+
+
+def refdes_groups():
+    """Instrument select groups keyed by site, with a blank placeholder."""
+    groups = {}
+    for refdes in SITES_DICT:
+        groups.setdefault(refdes.split("-")[0], []).append(refdes)
+    return {"": ["-- Select --"], **groups}
+
+
+def select_first(select, options, refresh):
+    """Load `options` and pick the first. Calls `refresh` when the value is
+    unchanged (same variable name in a new source), since no watcher fires."""
+    old = select.value
+    select.options = options
+    select.value = options[0] if options else None
+    if select.value == old:
+        refresh()
 
 
 # --- Data access ---
@@ -160,7 +178,7 @@ def time_dim(obj):
     return "peak_time" if "peak_time" in obj.dims else "time"
 
 
-@pn.cache
+@pn.cache(ttl=600)  # refresh so newly entered annotations show up
 def fetch_annotations(refdes):
     if not OOI_AUTH[0]:
         raise RuntimeError("Set OOI_USERNAME and OOI_TOKEN (env or .env) for annotations")
@@ -206,10 +224,8 @@ def deployment_overlay(refdes):
 
 
 def curated_refdes(dataset_name):
-    for prefix, refdes in CURATED_REFDES.items():
-        if dataset_name.startswith(prefix):
-            return refdes
-    return None
+    prefix = max((p for p in CURATED_REFDES if dataset_name.startswith(p)), key=len, default=None)
+    return CURATED_REFDES.get(prefix)
 
 
 def mask_gaps(da, tdim, factor=3.0):
@@ -274,15 +290,17 @@ def _clamp(rng, lo, hi, to_dt=False):
     return (a, b) if a < b else (lo, hi)
 
 
-def heatmap(da, tdim, style, cmap_name):
+def heatmap(da, tdim, style, cmap, clim, range_xy):
+    """Rasterized pressure-time heatmap. `cmap`/`clim` may be widget params or
+    bound functions; they restyle the live plot without resetting zoom.
+    `range_xy` is the RangeXY stream tracking the visible window."""
     label = style["label"]
     hover = HoverTool(
         tooltips=[("time", "$x{%F %H:%M}"), ("pressure", "$y{0} dbar"), (label, "@image")],
         formatters={"$x": "datetime"},
     )
     opts = dict(
-        cmap=cmocean.cm.cmap_d[cmap_name], colorbar=True, clabel=label,
-        clim=style["clim"] or (None, None), invert_yaxis=True,
+        colorbar=True, clabel=label, invert_yaxis=True,
         xlabel="Time", ylabel="Pressure (dbar)", tools=[hover],
         shared_axes=False, responsive=True, min_height=350, **DATETIME_OPTS,
     )
@@ -302,7 +320,8 @@ def heatmap(da, tdim, style, cmap_name):
             dynamic=False,
         ).opts(**opts)
 
-    return hv.DynamicMap(view, streams=[hv.streams.RangeXY(), hv.streams.PlotSize()])
+    dmap = hv.DynamicMap(view, streams=[range_xy, hv.streams.PlotSize()])
+    return dmap.apply.opts(cmap=cmap, clim=clim)
 
 
 def scatter_1d(da, tdim, style):
@@ -431,14 +450,24 @@ def detail_layer(refdes, var, label):
 
 # --- Panel scaffolding ---
 class PanelBase:
-    """Selector row + plot pane + error alert, removable from its column."""
+    """Selector row + plot pane + error alert; removable from its column when
+    given `on_remove`."""
 
-    def __init__(self, on_remove):
+    def __init__(self, on_remove=None):
+        self._gen = 0  # latest run() request; older results are dropped
         self.loading = pn.indicators.LoadingSpinner(value=False, width=30, height=30)
-        self.remove_btn = pn.widgets.Button(name="✕", button_type="danger", width=40)
-        self.remove_btn.on_click(lambda e: on_remove(self))
+        self.remove_btn = pn.widgets.Button(
+            name="✕", button_type="danger", width=40, visible=on_remove is not None)
+        if on_remove:
+            self.remove_btn.on_click(lambda e: on_remove(self))
         self.plot_pane = pn.pane.HoloViews(None, sizing_mode="stretch_width")
         self.error_pane = pn.pane.Alert("", alert_type="danger", visible=False)
+
+    def clear(self):
+        self.plot_pane.object = None
+
+    def close(self):
+        """Release resources when the panel is removed or the session ends."""
 
     def build_layout(self, *widgets):
         return pn.Column(
@@ -453,7 +482,10 @@ class PanelBase:
     def run(self, work, apply=None):
         """Run blocking `work` in a thread so the UI keeps repainting (loading
         overlay, spinner). Its result is applied on the event loop: via
-        `apply(result)` when given, else assigned to the plot pane."""
+        `apply(result)` when given, else assigned to the plot pane. A newer
+        request supersedes this one, so a slow load can't overwrite a fast one."""
+        self._gen += 1
+        gen = self._gen
         self.loading.value = True
         self.plot_pane.loading = True
         self.error_pane.visible = False
@@ -461,17 +493,22 @@ class PanelBase:
         async def task():
             try:
                 result = await asyncio.get_running_loop().run_in_executor(EXECUTOR, work)
+                if gen != self._gen:
+                    return
                 if apply is not None:
                     apply(result)
                 elif result is not None:
                     self.plot_pane.object = result
             except Exception as e:
                 print(f"[qc-explorer] {traceback.format_exc()}")
-                self.error_pane.object = f"**Error:** `{type(e).__name__}: {e}`"
-                self.error_pane.visible = True
+                if gen == self._gen:
+                    self.clear()
+                    self.error_pane.object = f"**Error:** `{type(e).__name__}: {e}`"
+                    self.error_pane.visible = True
             finally:
-                self.loading.value = False
-                self.plot_pane.loading = False
+                if gen == self._gen:
+                    self.loading.value = False
+                    self.plot_pane.loading = False
 
         pn.state.execute(task)
 
@@ -488,34 +525,57 @@ class CuratedPanel(PanelBase):
         self.cmap_select = pn.widgets.Select(name="Colormap", options=CMAP_OPTIONS, width=130)
         self.mask_toggle = pn.widgets.Checkbox(name="Mask gaps", value=True)
         self.deploy_toggle = pn.widgets.Checkbox(name="Deployments", value=False)
+        # heatmap color range: drag the slider or type either end (values past
+        # the slider bounds are allowed). Colormap and range restyle in place.
+        self.clim_slider = pn.widgets.EditableRangeSlider(
+            name="Color range", start=0.0, end=1.0, value=(0.0, 1.0), step=0.01,
+            format="0[.]000", width=340)
+        self.clim_std_btn = pn.widgets.Button(name="Standard", width=90, align="end")
+        self.clim_auto_btn = pn.widgets.Button(name="Fit view (2–98%)", width=130, align="end")
+        self.clim_std_btn.on_click(lambda e: self.clim_slider.param.update(value=self._clims["standard"]))
+        self.clim_auto_btn.on_click(lambda e: self._fit_view())
+        self.clim_row = pn.Row(self.clim_slider, self.clim_std_btn, self.clim_auto_btn,
+                               visible=False)
+        self._clims, self._clim_key, self._view = {}, None, None
         self.dataset_select.param.watch(self._dataset_changed, "value")
         self.var_select.param.watch(self._var_changed, "value")
-        for w in (self.cmap_select, self.mask_toggle, self.deploy_toggle):
-            w.param.watch(lambda e: self.run(self._build, apply=self._show), "value")
+        for w in (self.mask_toggle, self.deploy_toggle):
+            w.param.watch(lambda e: self._replot(), "value")
         self.layout = self.build_layout(
             self.dataset_select, self.var_select, self.cmap_select,
             self.mask_toggle, self.deploy_toggle)
+        self.layout.insert(1, self.clim_row)
+
+    def _replot(self):
+        self.run(self._build, apply=self._show)
 
     def _dataset_changed(self, event):
         datasets = discover_curated()
         if event.new not in datasets:
             self.var_select.options = []
-            self.plot_pane.object = None
+            self.clim_row.visible = False
+            self.clear()
             return
-        def set_vars(names):
-            self.var_select.options = names
-            self.var_select.value = names[0]
-        self.run(lambda: list(get_dataset(datasets[event.new]).data_vars), apply=set_vars)
+        self.run(lambda: list(get_dataset(datasets[event.new]).data_vars),
+                 apply=lambda names: select_first(self.var_select, names, self._replot))
 
     def _var_changed(self, event):
         if not event.new:
             return
-        # reset colormap to this variable's standard; the cmap watcher replots
-        standard = var_style(event.new)["cmap"]
-        if self.cmap_select.value != standard:
-            self.cmap_select.value = standard
-        else:
-            self.run(self._build, apply=self._show)
+        self.cmap_select.value = var_style(event.new)["cmap"]
+        self._replot()
+
+    def _fit_view(self):
+        """Set the color range to the 2–98th percentile of the visible window."""
+        da, tdim, rng = self._view
+        sel = {}
+        if rng.x_range:
+            sel[tdim] = slice(*sorted(_to_timestamp(v) for v in rng.x_range))
+        if rng.y_range:
+            sel["sea_water_pressure"] = slice(*sorted(rng.y_range))
+        lo, hi = (float(v) for v in da.sel(sel).quantile([0.02, 0.98]).values)
+        if lo < hi:
+            self.clim_slider.value = (lo, hi)
 
     def _build(self):
         datasets = discover_curated()
@@ -526,23 +586,43 @@ class CuratedPanel(PanelBase):
         da = load_var(datasets[name], var)
         style = var_style(var)
         tdim = time_dim(da)
+        clims = None
         if da.ndim == 2:
+            q = [float(v) for v in da.quantile([0.001, 0.02, 0.98, 0.999]).values]
+            clims = dict(standard=style["clim"], auto=(q[1], q[2]), bounds=(q[0], q[3]))
             if self.mask_toggle.value:
                 da = mask_gaps(da, tdim)
-            plot, is_2d = heatmap(da, tdim, style, self.cmap_select.value), True
+            cmap = pn.bind(lambda n: cmocean.cm.cmap_d[n], self.cmap_select)
+            rng = hv.streams.RangeXY()
+            plot = heatmap(da, tdim, style, cmap, self.clim_slider.param.value, rng)
+            clims["view"] = (da, tdim, rng)
         else:
-            plot, is_2d = scatter_1d(da, tdim, style), False
+            plot = scatter_1d(da, tdim, style)
         refdes = curated_refdes(name)
         if self.deploy_toggle.value and refdes:
             plot = plot * deployment_overlay(refdes)
-        return plot, is_2d
+        return plot, clims
 
     def _show(self, result):
         if result is None:
             return
-        plot, is_2d = result
+        plot, clims = result
+        is_2d = clims is not None
         self.cmap_select.disabled = not is_2d
         self.mask_toggle.disabled = not is_2d
+        self.clim_row.visible = is_2d
+        if is_2d:
+            # slider spans the data (0.1–99.9%) and the standard range; the
+            # value resets to standard only for a new dataset/variable
+            self._view = clims.pop("view")
+            self._clims = clims
+            clims["standard"] = clims["standard"] or clims["auto"]
+            lo = min(clims["bounds"][0], clims["standard"][0])
+            hi = max(clims["bounds"][1], clims["standard"][1])
+            key = (self.dataset_select.value, self.var_select.value)
+            reset = dict(value=clims["standard"]) if key != self._clim_key else {}
+            self._clim_key = key
+            self.clim_slider.param.update(start=lo, end=hi, step=(hi - lo) / 500, **reset)
         self.plot_pane.object = plot
 
 
@@ -555,11 +635,8 @@ class StreamPanel(PanelBase):
 
     def __init__(self, on_remove):
         super().__init__(on_remove)
-        groups = {}
-        for refdes in SITES_DICT:
-            groups.setdefault(refdes.split("-")[0], []).append(refdes)
         self.refdes_select = pn.widgets.Select(
-            name="Instrument", groups={"": ["-- Select --"], **groups}, width=340)
+            name="Instrument", groups=refdes_groups(), width=340)
         self.var_select = pn.widgets.Select(name="Variable", options=[], width=280)
         self.yrange_radio = pn.widgets.RadioButtonGroup(
             options=["Standard", "Auto"], value="Standard", width=150)
@@ -573,7 +650,11 @@ class StreamPanel(PanelBase):
         self.zoom_busy = pn.indicators.LoadingSpinner(
             value=False, size=22, color="warning", name="re-aggregating…",
             visible=False)
-        pn.state.param.watch(self._busy_changed, "busy")
+        # pn.state is process-wide: unwatch on panel removal / session end.
+        # Bind unwatch now; module globals are gone by session teardown.
+        watcher = pn.state.param.watch(self._busy_changed, "busy")
+        self._unwatch_busy = partial(pn.state.param.unwatch, watcher)
+        pn.state.on_session_destroyed(lambda ctx: self.close())
 
         self.refdes_select.param.watch(self._refdes_changed, "value")
         for w in (self.var_select, self.yrange_radio, self.anno_toggle,
@@ -590,6 +671,11 @@ class StreamPanel(PanelBase):
 
     def _busy_changed(self, event):
         self.zoom_busy.value = self.zoom_busy.visible = event.new
+
+    def close(self):
+        if self._unwatch_busy:
+            self._unwatch_busy()
+            self._unwatch_busy = None
 
     # -- annotation drafting --
     def _init_draft(self):
@@ -639,17 +725,13 @@ class StreamPanel(PanelBase):
     def _refdes_changed(self, event):
         if event.new not in SITES_DICT:
             self.var_select.options = []
-            self.plot_pane.object = None
+            self.clear()
             self.info_pane.visible = False
             return
-        def set_vars(options):
-            self.var_select.options = options
-            self.var_select.value = options[0] if options else None
         def go():
-            info = SITES_DICT[event.new]
-            ds = get_dataset(f"{OOI_DATA_BUCKET}/{info['zarr']}")
-            return [v for v in info["params"] if v in ds]
-        self.run(go, apply=set_vars)
+            ds = get_dataset(_stream_path(event.new))
+            return [v for v in SITES_DICT[event.new]["params"] if v in ds]
+        self.run(go, apply=lambda opts: select_first(self.var_select, opts, self._plot))
 
     def _plot(self):
         refdes = self.refdes_select.value
@@ -699,7 +781,7 @@ class StreamPanel(PanelBase):
             plot, main, n, notes = result
             self.bounds_stream = hv.streams.BoundsX(source=main)
             self.bounds_stream.param.watch(self._bounds_changed, "boundsx")
-            note = (f"**{n/1e6:.0f}M points** — hover reads binned value/count at any zoom; "
+            note = (f"**{n:,} points** — hover reads binned value/count at any zoom; "
                     f"individual points draw below {DETAIL_THRESHOLD:,} in view.")
             if notes:
                 note += " ⚠ " + "; ".join(notes)
@@ -722,7 +804,7 @@ def load_year(kind, key, var, year):
     ~200k points so multi-year overlays stay light."""
     if kind == "curated":
         return load_var(key, var).sel(time=str(year))
-    da = get_dataset(f"{OOI_DATA_BUCKET}/{SITES_DICT[key]['zarr']}")[var].sel(time=str(year))
+    da = get_dataset(_stream_path(key))[var].sel(time=str(year))
     stride = max(1, da.sizes["time"] // 200_000)
     return da.isel(time=slice(None, None, stride)).load()
 
@@ -732,8 +814,7 @@ class TimeMachinePanel(PanelBase):
     curated fixed-mooring products and (decimated) full ooi-data streams."""
 
     def __init__(self):
-        super().__init__(on_remove=lambda p: None)
-        self.remove_btn.visible = False
+        super().__init__()
         fixed = [k for k in discover_curated() if "_profiles_" not in k]
         self.sources = {k: ("curated", discover_curated()[k]) for k in fixed}
         self.sources.update({r: ("stream", r) for r in SITES_DICT})
@@ -768,23 +849,19 @@ class TimeMachinePanel(PanelBase):
 
     def _open(self):
         kind, key = self.sources[self.dataset_select.value]
-        if kind == "curated":
-            return kind, key, get_dataset(key)
-        return kind, key, get_dataset(f"{OOI_DATA_BUCKET}/{SITES_DICT[key]['zarr']}")
+        return kind, key, get_dataset(key if kind == "curated" else _stream_path(key))
 
     def _dataset_changed(self, event):
         if event.new not in self.sources:
-            self.plot_pane.object = None
+            self.clear()
             return
-        def set_vars(names):
-            self.var_select.options = names
-            self.var_select.value = names[0] if names else None
         def go():
             kind, key, ds = self._open()
             if kind == "stream":
                 return [v for v in SITES_DICT[key]["params"] if v in ds]
             return list(ds.data_vars)
-        self.run(go, apply=set_vars)
+        self.run(go, apply=lambda names: select_first(
+            self.var_select, names, self._years_then_plot))
 
     def _years_then_plot(self):
         if not self.var_select.value:
@@ -795,8 +872,9 @@ class TimeMachinePanel(PanelBase):
             self.year_select.options = years
             self.compare_select.options = years
             self.year_select.value = ref
-            # default: reference = last full year only; user adds comparisons
-            self.compare_select.value = []
+            # default: reference = last full year only; keep comparisons
+            # the user already picked that exist in this source
+            self.compare_select.value = [y for y in self.compare_select.value if y in years]
             self._remap_window(ref)
             self._suppress = False
             self.run(self._build)
@@ -869,46 +947,42 @@ class TimeMachinePanel(PanelBase):
                 min_height=400, responsive=True,
             ))
         if not curves:
-            return None
+            raise ValueError(f"No {var} data in the selected years/window")
         return hv.Overlay(curves).opts(
             shared_axes=False, legend_position="top_right", padding=(0, 0.1),
             invert_yaxis=self.invert_toggle.value, **DATETIME_OPTS)
 
 
-class AnnotationBrowser:
+class AnnotationBrowser(PanelBase):
     """Tab 4: searchable annotation table per reference designator."""
 
     def __init__(self):
-        groups = {}
-        for refdes in SITES_DICT:
-            groups.setdefault(refdes.split("-")[0], []).append(refdes)
+        super().__init__()
         self.refdes_select = pn.widgets.Select(
-            name="Instrument", groups={"": ["-- Select --"], **groups}, width=340)
+            name="Instrument", groups=refdes_groups(), width=340)
         self.count = pn.pane.Markdown("")
-        self.error_pane = pn.pane.Alert("", alert_type="danger", visible=False)
-        self.table = pn.widgets.Tabulator(
+        # the table stands in for the plot pane so run() drives its loading state
+        self.plot_pane = pn.widgets.Tabulator(
             pd.DataFrame(), header_filters=True, pagination="local", page_size=25,
             layout="fit_data_stretch", show_index=False, disabled=True,
             sizing_mode="stretch_width",
         )
         self.refdes_select.param.watch(self._load, "value")
-        self.layout = pn.Column(
-            pn.Row(self.refdes_select, self.count, align="center"),
-            self.error_pane, self.table, sizing_mode="stretch_width")
+        self.layout = self.build_layout(self.refdes_select, self.count)
+
+    def clear(self):
+        self.plot_pane.value = pd.DataFrame()
+        self.count.object = ""
 
     def _load(self, event):
-        self.error_pane.visible = False
         if event.new not in SITES_DICT:
+            self.clear()
             return
-        try:
-            df = fetch_annotations(event.new)
+        def show(df):
             cols = [c for c in ["beginDT", "endDT", "annotation", "qcFlag", "source"] if c in df]
-            self.table.value = df[cols] if not df.empty else pd.DataFrame()
+            self.plot_pane.value = df[cols] if not df.empty else pd.DataFrame()
             self.count.object = f"**{len(df)} annotations**"
-        except Exception as e:
-            print(f"[qc-explorer] {traceback.format_exc()}")
-            self.error_pane.object = f"**Error:** `{type(e).__name__}: {e}`"
-            self.error_pane.visible = True
+        self.run(lambda: fetch_annotations(event.new), apply=show)
 
 
 class MetadataPanel(PanelBase):
@@ -916,8 +990,7 @@ class MetadataPanel(PanelBase):
     (the same collapsible view a Dataset shows in a Jupyter notebook)."""
 
     def __init__(self):
-        super().__init__(on_remove=lambda p: None)
-        self.remove_btn.visible = False
+        super().__init__()
         # PanelBase.run() targets plot_pane; an HTML pane has the same
         # object/loading interface, so it slots straight in.
         self.plot_pane = pn.pane.HTML(None, sizing_mode="stretch_width")
@@ -936,7 +1009,7 @@ class MetadataPanel(PanelBase):
         elif event.new in SITES_DICT:
             path = _stream_path(event.new)
         else:
-            self.plot_pane.object = None
+            self.clear()
             return
         self.run(lambda: get_dataset(path)._repr_html_())
 
@@ -944,8 +1017,11 @@ class MetadataPanel(PanelBase):
 def multi_panel_tab(panel_cls):
     """Column of removable panels with an add button."""
     column = pn.Column(sizing_mode="stretch_width")
+    def remove(p):
+        p.close()
+        column.remove(p.layout)
     def add(event=None):
-        column.append(panel_cls(on_remove=lambda p: column.remove(p.layout)).layout)
+        column.append(panel_cls(on_remove=remove).layout)
     btn = pn.widgets.Button(name="+ Add panel", button_type="primary", width=150)
     btn.on_click(add)
     add()
