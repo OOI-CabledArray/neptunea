@@ -84,6 +84,9 @@ DATETIME_OPTS = dict(
 )
 CMAP_OPTIONS = sorted(m for m in cmocean.cm.cmap_d if not m.endswith("_r"))
 # rca-data-tools time-machine palette, indexed by years-back
+# HITL annotation spans, cycled in time order so neighbors/overlaps differ;
+# avoids QARTOD red/orange and deployment gray (colorblind-safe)
+ANNO_COLORS = ["#0072B2", "#009E73", "#CC79A7", "#999933"]
 TM_COLORS = ["#1f78b4", "#a6cee3", "#b2df8a", "#33a02c", "#fb9a99", "#e31a1c",
              "#fdbf6f", "#ff7f00", "#cab2d6", "#6a3ba2", "#8c564b", "#7f7f7f"]
 
@@ -217,9 +220,20 @@ def annotation_overlay(refdes):
     if df.empty:
         return hv.VSpans(([], [], []), vdims=["annotation"])
     end = df["endDT"].fillna(pd.Timestamp.now())
-    text = df["annotation"].str.slice(0, 150)
-    return hv.VSpans((df["beginDT"], end, text), vdims=["annotation"]).opts(
-        color="red", alpha=0.12, tools=["hover"]
+    text = df["annotation"].fillna("")
+    spans = pd.DataFrame({
+        "begin": df["beginDT"], "end": end,
+        "annotation": text.where(text.str.len() <= 400, text.str.slice(0, 400) + "…"),
+        "flag": df["qcFlag"].fillna("no flag"),
+        "dates": df["beginDT"].dt.strftime("%Y-%m-%d") + " → " + end.dt.strftime("%Y-%m-%d"),
+        "color": [ANNO_COLORS[i % len(ANNO_COLORS)] for i in range(len(df))],
+    })
+    hover = HoverTool(tooltips=(  # wrapped: long annotation text otherwise runs off the plot
+        '<div style="max-width:380px; white-space:normal">'
+        "<b>@flag</b> &middot; @dates<br>@annotation</div>"))
+    return hv.VSpans(spans, kdims=["begin", "end"], vdims=["annotation", "flag", "dates", "color"]).opts(
+        color="color", line_color="color", fill_alpha=0.15, line_alpha=0.7, line_width=1,
+        tools=[hover],
     )
 
 
@@ -392,6 +406,17 @@ STREAM_LAYERS = {  # QARTOD rollup flag value -> image style
     "3":  dict(cmap=["#ff8c00"]),
     "4":  dict(cmap=["#d62728"]),
 }
+FLAG_NAMES = {"3": "QARTOD suspect", "4": "QARTOD fail"}
+
+
+def flag_legend(flags, t0):
+    """Legend entries for the flag layers: rasters make no legend items, so
+    overlay square markers in the layer colors. Each holds one NaN point at
+    t0 (Bokeh draws no legend swatch for an empty series; NaN never plots)."""
+    return hv.Overlay([
+        hv.Scatter([(t0, float("nan"))], "time", "value", label=FLAG_NAMES[f]).opts(
+            color=STREAM_LAYERS[f]["cmap"][0], marker="square", size=10)
+        for f in flags])
 
 
 def _stream_path(refdes):
@@ -833,6 +858,8 @@ class StreamPanel(PanelBase):
             for f in flags[1:]:
                 plot = plot * stream_layer(refdes, var, f, label, overview_y)
             plot = plot * detail_layer(refdes, var, label)
+            if flags[1:]:
+                plot = plot * flag_legend(flags[1:], ds.indexes["time"][0])
             if self.clim_toggle.value:
                 idx = ds.indexes["time"]
                 band = climatology_overlay(refdes, var, idx[0], idx[-1])
@@ -847,21 +874,20 @@ class StreamPanel(PanelBase):
                         plot = plot * fn(refdes)
                     except Exception as e:
                         notes.append(f"{name} unavailable: {e}")
-            plot = plot.opts(shared_axes=False, responsive=True, min_height=450, **DATETIME_OPTS)
+            plot = plot.opts(shared_axes=False, responsive=True, min_height=450,
+                             legend_position="top_left", **DATETIME_OPTS)
             if ylim:
                 plot = plot.opts(ylim=ylim)
-            return plot, main, ds[var].sizes["time"], notes, ylim is None, len(flags) > 1
+            return plot, main, ds[var].sizes["time"], notes, ylim is None
 
         def show(result):
-            plot, main, n, notes, auto, flagged = result
+            plot, main, n, notes, auto = result
             self.bounds_stream = hv.streams.BoundsX(source=main)
             self.bounds_stream.param.watch(self._bounds_changed, "boundsx")
             note = (f"**{n:,} points** — hover reads binned value/count at any zoom; "
                     f"individual points draw below {DETAIL_THRESHOLD:,} in view.")
             if auto:
                 note += " Auto y-range fits the middle 98% of values; zoom or pan to find spikes."
-            if flagged:
-                note += " QARTOD: orange = suspect, red = fail."
             if notes:
                 note += " ⚠ " + "; ".join(notes)
             self.info_pane.object = note
