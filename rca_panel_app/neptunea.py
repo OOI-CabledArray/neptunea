@@ -431,14 +431,16 @@ def bulk_range(refdes, var, q=(0.01, 0.99)):
 
 @pn.cache(max_items=12, policy="LRU")
 def stream_overview(refdes, var, flag, y_range):
-    """Full-record raster over a fixed y_range, so spikes/fill values far
-    outside it can't squash the real data into a few pixel rows."""
+    """Full-record raster over the stream's time span and a fixed y_range:
+    spikes/fill values can't squash the real data into a few pixel rows, and
+    a flag with no points yields an empty layer instead of one at 1970."""
     ds = get_dataset(_stream_path(refdes))
-    fcol = flag_col(ds, var)
+    fcol, idx = flag_col(ds, var), ds.indexes["time"]
     ddf = ds[[var] + ([fcol] if fcol else [])].unify_chunks().to_dask_dataframe()
     if flag:
         ddf = ddf[ddf[fcol].astype(str).str.strip() == flag]
-    return _rasterize(ddf, var, y_range=y_range, width=OVERVIEW_WIDTH)
+    return _rasterize(ddf, var, x_range=(idx[0].to_datetime64(), idx[-1].to_datetime64()),
+                      y_range=y_range, width=OVERVIEW_WIDTH)
 
 
 @lru_cache(maxsize=8)
@@ -848,16 +850,18 @@ class StreamPanel(PanelBase):
             plot = plot.opts(shared_axes=False, responsive=True, min_height=450, **DATETIME_OPTS)
             if ylim:
                 plot = plot.opts(ylim=ylim)
-            return plot, main, ds[var].sizes["time"], notes, ylim is None
+            return plot, main, ds[var].sizes["time"], notes, ylim is None, len(flags) > 1
 
         def show(result):
-            plot, main, n, notes, auto = result
+            plot, main, n, notes, auto, flagged = result
             self.bounds_stream = hv.streams.BoundsX(source=main)
             self.bounds_stream.param.watch(self._bounds_changed, "boundsx")
             note = (f"**{n:,} points** — hover reads binned value/count at any zoom; "
                     f"individual points draw below {DETAIL_THRESHOLD:,} in view.")
             if auto:
                 note += " Auto y-range fits the middle 98% of values; zoom or pan to find spikes."
+            if flagged:
+                note += " QARTOD: orange = suspect, red = fail."
             if notes:
                 note += " ⚠ " + "; ".join(notes)
             self.info_pane.object = note
