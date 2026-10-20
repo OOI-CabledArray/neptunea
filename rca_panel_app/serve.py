@@ -1,9 +1,9 @@
-"""Console entry point: launch the QC Explorer with `qc-explorer`."""
+"""Console entry point: launch Neptunea with `neptunea`."""
 from pathlib import Path
 
 import click
 
-APP = Path(__file__).parent / "qc_explorer.py"
+APP = Path(__file__).parent / "neptunea.py"
 
 
 @click.command()

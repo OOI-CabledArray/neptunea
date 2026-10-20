@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "rca-panel-app"
 version = "0.1.0"
-description = "RCA QC Explorer: interactive Panel app for verifying OOI Regional Cabled Array data products"
+description = "Neptunea: interactive Panel app for verifying OOI Regional Cabled Array data products"
 requires-python = ">=3.10"
 dependencies = [
     "panel",
@@ -26,7 +26,7 @@ dependencies = [
 ]
 
 [project.scripts]
-qc-explorer = "rca_panel_app.serve:main"
+neptunea = "rca_panel_app.serve:main"
 
 [tool.setuptools]
 packages = ["rca_panel_app"]

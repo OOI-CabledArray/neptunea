@@ -1,6 +1,6 @@
-# Deploying the QC Explorer on AWS
+# Deploying Neptunea on AWS
 
-One CloudFormation template ([qc-explorer.yaml](qc-explorer.yaml)) creates
+One CloudFormation template ([neptunea.yaml](neptunea.yaml)) creates
 everything; deleting the stack removes it. No tools to install — it is
 deployed from the AWS console.
 
@@ -12,7 +12,7 @@ deployed from the AWS console.
 | Elastic IP | Fixed URL across stop/start |
 | Security group | HTTP from one IP range only; no SSH (admin via Session Manager) |
 | Two EventBridge schedules | Start 7am / stop 7pm Pacific, weekdays |
-| IAM roles | Server: read data buckets + `/qc-explorer/*` settings. Scheduler: start/stop this server |
+| IAM roles | Server: read data buckets + `/neptunea/*` settings. Scheduler: start/stop this server |
 
 Rough on-demand cost in us-west-2: ~$35/month on the weekday schedule
 (~$28 compute, ~$4 IP, ~$2 disk) vs ~$85/month running 24/7.
@@ -38,18 +38,18 @@ Standard, in us-west-2:
 
 | Name | Type | Value |
 |---|---|---|
-| `/qc-explorer/env/OOI_USERNAME` | String | OOI API username (annotations/deployments) |
-| `/qc-explorer/env/OOI_TOKEN` | SecureString | OOI API token |
+| `/neptunea/env/OOI_USERNAME` | String | OOI API username (annotations/deployments) |
+| `/neptunea/env/OOI_TOKEN` | SecureString | OOI API token |
 
-Anything under `/qc-explorer/env/` becomes an environment variable for the
+Anything under `/neptunea/env/` becomes an environment variable for the
 app. These live outside the stack, so they survive a delete/redeploy.
 
 ## 2. Create the stack
 
 Console → **CloudFormation → Create stack → With new resources** → *Upload a
-template file* → `deploy/qc-explorer.yaml`.
+template file* → `deploy/neptunea.yaml`.
 
-- Stack name: `rca-qc-explorer`
+- Stack name: `neptunea`
 - `AllowedCidr`: the range from above; leave the rest at defaults
 - Check *I acknowledge that AWS CloudFormation might create IAM resources* →
   **Submit**
@@ -59,7 +59,7 @@ install Python and packages.
 
 ## 3. Open it
 
-The stack's **Outputs** tab has `Url` (`http://<ip>/qc_explorer`) — share
+The stack's **Outputs** tab has `Url` (`http://<ip>/neptunea`) — share
 that with coworkers.
 
 ## Day to day
@@ -67,12 +67,12 @@ that with coworkers.
 | Task | How |
 |---|---|
 | Ship a change | Push to `main`; live at next morning start, or restart now |
-| Shell on the server | EC2 → Instances → `rca-qc-explorer` → **Connect** → Session Manager |
-| Restart / logs | `sudo systemctl restart qc-explorer` / `sudo journalctl -u qc-explorer -f` |
+| Shell on the server | EC2 → Instances → `neptunea` → **Connect** → Session Manager |
+| Restart / logs | `sudo systemctl restart neptunea` / `sudo journalctl -u neptunea -f` |
 | First-boot log | `/var/log/cloud-init-output.log` |
-| Use it after hours | EC2 → Instances → `rca-qc-explorer` → Instance state → **Start** (still stops at 7pm) |
+| Use it after hours | EC2 → Instances → `neptunea` → Instance state → **Start** (still stops at 7pm) |
 | Change hours / run 24/7 | CloudFormation → stack → **Update** → *Use existing template* → edit `StartCron`/`StopCron`, or set `ScheduleState` to `DISABLED` |
-| Change dependencies | Edit `pyproject.toml`, run `uv lock`, test with `uv run qc-explorer`, commit both |
+| Change dependencies | Edit `pyproject.toml`, run `uv lock`, test with `uv run neptunea`, commit both |
 | Upgrade packages | `uv lock --upgrade`, test, commit `uv.lock` |
 | Tear down | CloudFormation → stack → **Delete** (Parameter Store entries stay) |
 

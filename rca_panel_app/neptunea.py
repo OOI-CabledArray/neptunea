@@ -1,4 +1,4 @@
-"""RCA QC Explorer — interactive companion to the rca-data-tools QAQC pipeline.
+"""Neptunea — interactive companion to the rca-data-tools QAQC pipeline.
 
 Five tabs:
   1. Curated Products — verify CRESST curated zarr products (profiler heatmaps,
@@ -22,8 +22,8 @@ params/variableParameters.csv; heatmaps use profileMin/profileMax, 1D uses
 min/max. Requires OOI_USERNAME / OOI_TOKEN in the environment (or .env) for
 annotation features.
 
-    qc-explorer                               # console entry point
-    panel serve rca_panel_app/qc_explorer.py  # equivalent
+    neptunea                               # console entry point
+    panel serve rca_panel_app/neptunea.py  # equivalent
 """
 import panel as pn
 pn.extension('tabulator', loading_spinner='dots')
@@ -500,7 +500,7 @@ class PanelBase:
                 elif result is not None:
                     self.plot_pane.object = result
             except Exception as e:
-                print(f"[qc-explorer] {traceback.format_exc()}")
+                print(f"[neptunea] {traceback.format_exc()}")
                 if gen == self._gen:
                     self.clear()
                     self.error_pane.object = f"**Error:** `{type(e).__name__}: {e}`"
@@ -1039,7 +1039,7 @@ tabs = pn.Tabs(
 )
 
 template = pn.template.FastListTemplate(
-    title="RCA QC Explorer",
+    title="Neptunea",
     main=[tabs],
     accent_base_color="#1a6b8a",
     header_background="#1a6b8a",

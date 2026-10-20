@@ -1,8 +1,9 @@
-# RCA QC Explorer
+# Neptunea
 
 Interactive [Panel](https://panel.holoviz.org) app for QC of OOI Regional
 Cabled Array data — hover and zoom to pinpoint when a data problem starts.
 Companion to [rca-data-tools](https://github.com/OOI-CabledArray/rca-data-tools).
+Named for *Neptunea*, a slow-moving marine snail.
 
 ## Tabs
 
@@ -22,8 +23,8 @@ Companion to [rca-data-tools](https://github.com/OOI-CabledArray/rca-data-tools)
 ## Install & run
 
 ```bash
-uv run qc-explorer         # installs the locked env (uv.lock) on first run
-# or: pip install -e . && qc-explorer
+uv run neptunea            # installs the locked env (uv.lock) on first run
+# or: pip install -e . && neptunea
 ```
 
 Needs AWS credentials for S3; `OOI_USERNAME`/`OOI_TOKEN` (env or `.env`) for
