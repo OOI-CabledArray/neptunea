@@ -35,6 +35,7 @@ import datetime
 import asyncio
 import traceback
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from functools import lru_cache, partial
 from pathlib import Path
 
@@ -59,6 +60,7 @@ CURATED_BUCKET = "rca-advanced-qaqc"
 OOI_DATA_BUCKET = "ooi-data"
 ANNO_URL = "https://ooinet.oceanobservatories.org/api/m2m/12580/anno/find"
 DEPLOY_URL = "https://ooinet.oceanobservatories.org/api/m2m/12587/events/deployment/query"
+METADATA_URL = "https://ooinet.oceanobservatories.org/api/m2m/12576/sensor/inv/{}/{}/{}/metadata"
 OOI_AUTH = (os.getenv("OOI_USERNAME", ""), os.getenv("OOI_TOKEN", ""))
 
 QC_LOOKUP = Path.home() / "repos/qc-lookup/qartod"
@@ -233,6 +235,18 @@ def fetch_deployments(refdes):
     )
 
 
+@pn.cache
+def parameter_ids(refdes):
+    """zarr variable -> OOI parameter number (PD908 -> 908) for annotation
+    `parameters`. Matched on the variable name, else its alternate_parameter_name."""
+    sub, node, sensor = refdes.split("-", 2)
+    resp = requests.get(METADATA_URL.format(sub, node, sensor), auth=OOI_AUTH, timeout=30)
+    resp.raise_for_status()
+    ids = {p["particleKey"]: int(p["pdId"].removeprefix("PD")) for p in resp.json()["parameters"]}
+    ds = get_dataset(_stream_path(refdes))
+    return {v: ids.get(v, ids.get(ds[v].attrs.get("alternate_parameter_name"))) for v in ds.data_vars}
+
+
 def deployment_overlay(refdes):
     deps = fetch_deployments(refdes)
     return hv.VLines(
@@ -395,14 +409,36 @@ def _rasterize(data, var, x_range=None, y_range=None, width=1200):
                      width=width, height=400)
 
 
+@pn.cache(max_items=64)
+def bulk_range(refdes, var, q=(0.01, 0.99)):
+    """Range of the middle 98% of a stream's values (+5% pad), sampled from
+    ~3 chunks spread across the record (S3 reads whole chunks, so sampling
+    more blocks approaches a full scan). None for constant/empty data
+    (rasterize then uses the data extent)."""
+    da = get_dataset(_stream_path(refdes))[var]
+    starts, pos = [], 0
+    for size in da.chunks[0]:
+        starts.append(pos)
+        pos += size
+    picks = starts[::max(len(starts) // 3, 1)]
+    sample = xr.concat([da.isel(time=slice(s, s + 20_000)) for s in picks], "time")
+    lo, hi = (float(v) for v in sample.quantile(list(q)).values)
+    if not lo < hi:
+        return None
+    pad = (hi - lo) * 0.05
+    return lo - pad, hi + pad
+
+
 @pn.cache(max_items=12, policy="LRU")
-def stream_overview(refdes, var, flag):
+def stream_overview(refdes, var, flag, y_range):
+    """Full-record raster over a fixed y_range, so spikes/fill values far
+    outside it can't squash the real data into a few pixel rows."""
     ds = get_dataset(_stream_path(refdes))
     fcol = flag_col(ds, var)
     ddf = ds[[var] + ([fcol] if fcol else [])].unify_chunks().to_dask_dataframe()
     if flag:
         ddf = ddf[ddf[fcol].astype(str).str.strip() == flag]
-    return _rasterize(ddf, var, width=OVERVIEW_WIDTH)
+    return _rasterize(ddf, var, y_range=y_range, width=OVERVIEW_WIDTH)
 
 
 @lru_cache(maxsize=8)
@@ -413,7 +449,7 @@ def load_slice(refdes, var, lo, hi, stride):
         .to_dataframe().reset_index()
 
 
-def stream_layer(refdes, var, flag, label):
+def stream_layer(refdes, var, flag, label, overview_y):
     ds = get_dataset(_stream_path(refdes))
     idx, fcol = ds.indexes["time"], flag_col(ds, var)
     hover = HoverTool(
@@ -421,7 +457,7 @@ def stream_layer(refdes, var, flag, label):
         formatters={"$x": "datetime"},
     )
     opts = dict(nodata=0, xlabel="Time", ylabel=label,
-                tools=[hover] if flag is None else [], **STREAM_LAYERS[flag])
+                tools=[hover, "xbox_select"] if flag is None else [], **STREAM_LAYERS[flag])
 
     def view(x_range, y_range):
         if x_range is not None:
@@ -440,7 +476,7 @@ def stream_layer(refdes, var, flag, label):
                 y0, y1 = yr_ or (0.0, 1.0)
                 return hv.Image(([xr_[0], xr_[1]], [y0, y1],
                                  np.full((2, 2), np.nan)), ["time", var]).opts(**opts)
-        return stream_overview(refdes, var, flag).opts(**opts)
+        return stream_overview(refdes, var, flag, overview_y).opts(**opts)
 
     return hv.DynamicMap(view, streams=[hv.streams.RangeXY()])
 
@@ -704,15 +740,21 @@ class StreamPanel(PanelBase):
             name="qcFlag", options=QC_FLAG_OPTIONS, value="suspect", width=150)
         self.draft_text = pn.widgets.TextAreaInput(
             name="Annotation", rows=3, width=620, placeholder="Describe the problem…")
+        self.draft_source = pn.widgets.TextInput(
+            name="Your name/email (source)", width=250)
         self.draft_json = pn.widgets.TextAreaInput(
             name="M2M payload (copy/paste)", rows=8, width=620, disabled=True)
-        for w in (self.draft_begin, self.draft_end, self.draft_flag, self.draft_text):
+        self.draft_note = pn.pane.Markdown("")
+        for w in (self.draft_begin, self.draft_end, self.draft_flag, self.draft_text,
+                  self.draft_source, self.var_select):
             w.param.watch(lambda e: self._update_draft(), "value")
         self.draft_card = pn.Card(
-            pn.Row(self.draft_begin, self.draft_end, self.draft_flag),
-            self.draft_text, self.draft_json,
-            title="Draft annotation — drag an x-box-select on the plot to set the time range",
-            collapsed=True, sizing_mode="stretch_width")
+            pn.pane.Markdown("Builds an M2M annotation payload to copy; nothing is sent to OOI. "
+                             "Set the time range by choosing the **box select** tool in the "
+                             "plot toolbar and dragging across the plot, or type it below."),
+            pn.Row(self.draft_begin, self.draft_end, self.draft_flag, self.draft_source),
+            self.draft_text, self.draft_note, self.draft_json,
+            title="Draft annotation", collapsed=True, sizing_mode="stretch_width")
         self.bounds_stream = None
 
     def _bounds_changed(self, event):
@@ -729,6 +771,14 @@ class StreamPanel(PanelBase):
             return
         subsite, node, sensor = refdes.split("-", 2)
         method, stream = SITES_DICT[refdes]["zarr"].removeprefix(f"{refdes}-").split("-", 1)
+        var = self.var_select.value
+        try:
+            pid = parameter_ids(refdes).get(var)
+        except Exception:  # metadata lookup needs OOI credentials
+            pid = None
+        self.draft_note.object = (
+            f"Applies to `{var}` (PD{pid})." if pid else
+            f"`{var}` has no OOI parameter ID, so the annotation would cover the whole stream.")
         payload = {
             "subsite": subsite, "node": node, "sensor": sensor,
             "method": method, "stream": stream,
@@ -736,7 +786,8 @@ class StreamPanel(PanelBase):
             "endDT": int(pd.Timestamp(self.draft_end.value).timestamp() * 1000) if self.draft_end.value else None,
             "annotation": self.draft_text.value,
             "qcFlag": self.draft_flag.value,
-            "source": OOI_AUTH[0],
+            "parameters": [pid] if pid else [],
+            "source": self.draft_source.value,
         }
         self.draft_json.value = json.dumps(payload, indent=2)
 
@@ -770,12 +821,15 @@ class StreamPanel(PanelBase):
             flags = [None] + (["3", "4"] if self.flags_toggle.value and has_flags else [])
             if self.flags_toggle.value and not has_flags:
                 notes.append("no QARTOD results variable for this parameter")
+            overview_y = ylim or bulk_range(refdes, var)
             for f in flags:  # warm the overview cache here, off the event loop
-                stream_overview(refdes, var, f)
-            main = stream_layer(refdes, var, None, label)
+                stream_overview(refdes, var, f, overview_y)
+            with suppress(Exception):  # warm for annotation drafts; needs OOI credentials
+                parameter_ids(refdes)
+            main = stream_layer(refdes, var, None, label, overview_y)
             plot = main
             for f in flags[1:]:
-                plot = plot * stream_layer(refdes, var, f, label)
+                plot = plot * stream_layer(refdes, var, f, label, overview_y)
             plot = plot * detail_layer(refdes, var, label)
             if self.clim_toggle.value:
                 idx = ds.indexes["time"]
@@ -794,14 +848,16 @@ class StreamPanel(PanelBase):
             plot = plot.opts(shared_axes=False, responsive=True, min_height=450, **DATETIME_OPTS)
             if ylim:
                 plot = plot.opts(ylim=ylim)
-            return plot, main, ds[var].sizes["time"], notes
+            return plot, main, ds[var].sizes["time"], notes, ylim is None
 
         def show(result):
-            plot, main, n, notes = result
+            plot, main, n, notes, auto = result
             self.bounds_stream = hv.streams.BoundsX(source=main)
             self.bounds_stream.param.watch(self._bounds_changed, "boundsx")
             note = (f"**{n:,} points** — hover reads binned value/count at any zoom; "
                     f"individual points draw below {DETAIL_THRESHOLD:,} in view.")
+            if auto:
+                note += " Auto y-range fits the middle 98% of values; zoom or pan to find spikes."
             if notes:
                 note += " ⚠ " + "; ".join(notes)
             self.info_pane.object = note

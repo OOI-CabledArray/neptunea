@@ -16,8 +16,11 @@ Named for *Neptunea*, a slow-moving marine snail.
   2–98th percentile of the zoomed view — all without losing zoom.
 - **Full Time Series** — any `ooi-data` stream at native resolution. Hover at
   every zoom level; cached overview → windowed re-aggregation → points once
-  sparse. Overlays: annotations, deployments, QARTOD flags, climatology.
-  Drag-select a range to draft an M2M annotation payload (never POSTs).
+  sparse. Y-range: params standard, or Auto (middle 98% of values, so
+  spikes don't flatten the view). Overlays: annotations, deployments, QARTOD
+  flags, climatology. Draft an M2M annotation payload to copy (never POSTs):
+  box-select tool + drag sets the time range; includes the variable's OOI
+  parameter ID and your name/email as source.
 - **Time Machine** — year-over-year overlay of fixed products and streams.
 - **Annotations** — searchable HITL annotation table per refdes.
 - **Metadata** — xarray notebook-style repr for any store.
