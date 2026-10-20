@@ -1,0 +1,229 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  RCA QC Explorer: one EC2 server running the Panel app, a fixed public IP,
+  and a weekday start/stop schedule. See deploy/README.md.
+
+Parameters:
+  AllowedCidr:
+    Type: String
+    Description: >-
+      IP range allowed to open the app, e.g. your campus/VPN range
+      (x.x.x.x/16) or a single office IP (x.x.x.x/32). The app has no login,
+      so keep this narrow.
+    AllowedPattern: '^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$'
+  InstanceType:
+    Type: String
+    Default: r7g.large
+    Description: >-
+      r7g.large = 2 vCPU / 16 GB (ARM). Memory matters most: curated
+      variables and stream overviews are cached in RAM. Switching to an Intel
+      type (e.g. r7i.large) requires the x86_64 AmiParameter.
+  AmiParameter:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    Description: Latest Amazon Linux 2023 image, looked up at deploy time.
+  RepoUrl:
+    Type: String
+    Default: https://github.com/OOI-CabledArray/rca-panel-app.git
+  Branch:
+    Type: String
+    Default: main
+  StartCron:
+    Type: String
+    Default: cron(0 7 ? * MON-FRI *)
+    Description: When to start the server (EventBridge Scheduler cron).
+  StopCron:
+    Type: String
+    Default: cron(0 19 ? * MON-FRI *)
+    Description: When to stop the server (EventBridge Scheduler cron).
+  ScheduleTimezone:
+    Type: String
+    Default: America/Los_Angeles
+  ScheduleState:
+    Type: String
+    Default: ENABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: DISABLED leaves the server in whatever state it is in (e.g. running 24/7).
+
+Resources:
+  # --- Network access: HTTP from AllowedCidr only; admin via Session Manager (no SSH)
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RCA QC Explorer web access
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref AllowedCidr
+
+  # Fixed address so the URL survives stop/start
+  ElasticIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags: [{Key: Name, Value: rca-qc-explorer}]
+
+  EIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt ElasticIP.AllocationId
+      InstanceId: !Ref Instance
+
+  # --- Server permissions: Session Manager, read /qc-explorer/* settings, read data buckets
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: qc-explorer
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [ssm:GetParameter, ssm:GetParametersByPath]
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/qc-explorer
+                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/qc-explorer/*
+              - Effect: Allow
+                Action: [s3:GetObject, s3:ListBucket]
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::ooi-data
+                  - !Sub arn:${AWS::Partition}:s3:::ooi-data/*
+                  - !Sub arn:${AWS::Partition}:s3:::rca-advanced-qaqc
+                  - !Sub arn:${AWS::Partition}:s3:::rca-advanced-qaqc/*
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  # --- The server. First boot installs git + uv and a systemd service; every
+  # service start pulls the branch, syncs the locked env, and serves on port 80.
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiParameter
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      SecurityGroupIds: [!GetAtt SecurityGroup.GroupId]
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs: {VolumeSize: 30, VolumeType: gp3}
+      Tags: [{Key: Name, Value: rca-qc-explorer}]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          dnf install -y git tar
+          curl -LsSf https://astral.sh/uv/0.9.7/install.sh | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh
+          useradd --system --create-home --home-dir /opt/qc-explorer qcx
+
+          cat > /usr/local/bin/qc-explorer-start <<'EOF'
+          #!/bin/bash
+          # Runs on every service start: update code, sync env, launch.
+          set -eo pipefail
+          cd /opt/qc-explorer
+          # private repo: read-only GitHub token from Parameter Store, if present
+          TOKEN=$(aws ssm get-parameter --name /qc-explorer/github-token --with-decryption \
+                    --query Parameter.Value --output text 2>/dev/null || true)
+          if [ -n "$TOKEN" ]; then
+            export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.extraHeader
+            export GIT_CONFIG_VALUE_0="Authorization: Basic $(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)"
+          fi
+          if [ -d app/.git ]; then
+            git -C app pull --ff-only || echo "git pull failed; running existing checkout"
+          else
+            git clone --branch "$BRANCH" "$REPO" app
+          fi
+          cd app
+          uv sync --locked
+          # app settings (OOI_USERNAME, OOI_TOKEN, ...) from /qc-explorer/env/<NAME>
+          while read -r name value; do
+            if [ -n "$name" ]; then export "$(basename "$name")=$value"; fi
+          done < <(aws ssm get-parameters-by-path --path /qc-explorer/env/ --with-decryption \
+                     --query 'Parameters[].[Name,Value]' --output text)
+          exec .venv/bin/panel serve rca_panel_app/qc_explorer.py \
+            --address 0.0.0.0 --port 80 --allow-websocket-origin "$ORIGIN"
+          EOF
+          chmod 755 /usr/local/bin/qc-explorer-start
+
+          cat > /etc/systemd/system/qc-explorer.service <<'EOF'
+          [Unit]
+          Description=RCA QC Explorer
+          Wants=network-online.target
+          After=network-online.target
+
+          [Service]
+          User=qcx
+          Environment=REPO=${RepoUrl} BRANCH=${Branch} ORIGIN=${ElasticIP} AWS_DEFAULT_REGION=${AWS::Region}
+          Environment=PATH=/usr/local/bin:/usr/bin:/bin
+          ExecStart=/usr/local/bin/qc-explorer-start
+          AmbientCapabilities=CAP_NET_BIND_SERVICE
+          Restart=on-failure
+          RestartSec=10
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          systemctl daemon-reload
+          systemctl enable --now qc-explorer
+
+  # --- Weekday schedule
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: scheduler.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: start-stop
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [ec2:StartInstances, ec2:StopInstances]
+                Resource: !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${Instance}
+
+  StartSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Description: Start RCA QC Explorer
+      ScheduleExpression: !Ref StartCron
+      ScheduleExpressionTimezone: !Ref ScheduleTimezone
+      State: !Ref ScheduleState
+      FlexibleTimeWindow: {Mode: "OFF"}
+      Target:
+        Arn: arn:aws:scheduler:::aws-sdk:ec2:startInstances
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: !Sub '{"InstanceIds": ["${Instance}"]}'
+
+  StopSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Description: Stop RCA QC Explorer
+      ScheduleExpression: !Ref StopCron
+      ScheduleExpressionTimezone: !Ref ScheduleTimezone
+      State: !Ref ScheduleState
+      FlexibleTimeWindow: {Mode: "OFF"}
+      Target:
+        Arn: arn:aws:scheduler:::aws-sdk:ec2:stopInstances
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: !Sub '{"InstanceIds": ["${Instance}"]}'
+
+Outputs:
+  Url:
+    Description: Share this with coworkers
+    Value: !Sub http://${ElasticIP}/qc_explorer
+  InstanceId:
+    Value: !Ref Instance

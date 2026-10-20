@@ -22,12 +22,15 @@ Companion to [rca-data-tools](https://github.com/OOI-CabledArray/rca-data-tools)
 ## Install & run
 
 ```bash
-pip install -e .
-qc-explorer                # or: panel serve rca_panel_app/qc_explorer.py
+uv run qc-explorer         # installs the locked env (uv.lock) on first run
+# or: pip install -e . && qc-explorer
 ```
 
 Needs AWS credentials for S3; `OOI_USERNAME`/`OOI_TOKEN` (env or `.env`) for
-annotation/deployment features.
+annotation/deployment features. After changing dependencies in
+`pyproject.toml`, run `uv lock` and commit `uv.lock`.
+
+Hosted deployment (EC2 on a weekday schedule): see [deploy/README.md](deploy/README.md).
 
 ## Notes
 
