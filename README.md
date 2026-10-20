@@ -7,9 +7,11 @@ Named for *Neptunea*, a slow-moving marine snail.
 
 ## Tabs
 
-- **Curated Products** — CRESST zarr products as heatmaps (profilers) or time
-  series (fixed moorings). Hover, cmocean colormap selector, gap masking,
-  deployment markers, side-by-side comparison panels. Heatmap color range:
+- **Curated Products** — curated zarr products from every folder in
+  `rca-advanced-qaqc` (`cresst/`, `cresst-one-easy-rca/`, …; new products appear
+  within 10 min) as heatmaps (profilers) or time series (fixed moorings).
+  Hover, cmocean colormap selector, gap masking, deployment markers,
+  side-by-side comparison panels. Heatmap color range:
   drag or type the min/max, reset to the params standard, or fit to the
   2–98th percentile of the zoomed view — all without losing zoom.
 - **Full Time Series** — any `ooi-data` stream at native resolution. Hover at

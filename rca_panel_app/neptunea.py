@@ -55,7 +55,7 @@ try:
 except ImportError:
     pass
 
-CURATED_PREFIX = "rca-advanced-qaqc/cresst"
+CURATED_BUCKET = "rca-advanced-qaqc"
 OOI_DATA_BUCKET = "ooi-data"
 ANNO_URL = "https://ooinet.oceanobservatories.org/api/m2m/12580/anno/find"
 DEPLOY_URL = "https://ooinet.oceanobservatories.org/api/m2m/12587/events/deployment/query"
@@ -149,10 +149,28 @@ def select_first(select, options, refresh):
 
 
 # --- Data access ---
-@pn.cache
+@pn.cache(ttl=600)  # pick up newly written products
 def discover_curated():
-    paths = sorted(fs.glob(f"{CURATED_PREFIX}/*.zarr") + fs.glob(f"{CURATED_PREFIX}/*/*.zarr"))
-    return {p.removeprefix(f"{CURATED_PREFIX}/"): p for p in paths}
+    """Curated *.zarr products in every top-level folder of the bucket
+    (cresst/, cresst-one-easy-rca/, ...), keyed "folder/name.zarr". Folders
+    that are themselves zarr stores (advanced-QC instrument streams) are skipped."""
+    fs.invalidate_cache(CURATED_BUCKET)
+    paths = []
+    for d in fs.ls(CURATED_BUCKET, detail=True):
+        folder = d["name"]
+        if d["type"] != "directory" or fs.exists(f"{folder}/.zgroup") or fs.exists(f"{folder}/zarr.json"):
+            continue
+        paths += fs.glob(f"{folder}/*.zarr") + fs.glob(f"{folder}/*/*.zarr")
+    return {p.removeprefix(f"{CURATED_BUCKET}/"): p for p in sorted(paths)}
+
+
+def curated_groups(keys):
+    """Select groups per bucket folder: {folder: {product name: key}}."""
+    groups = {}
+    for k in keys:
+        folder, _, name = k.partition("/")
+        groups.setdefault(folder, {})[name] = k
+    return groups
 
 
 @pn.cache
@@ -223,8 +241,9 @@ def deployment_overlay(refdes):
     ).opts(line_color="gray", line_dash="dashed", line_width=1, tools=["hover"])
 
 
-def curated_refdes(dataset_name):
-    prefix = max((p for p in CURATED_REFDES if dataset_name.startswith(p)), key=len, default=None)
+def curated_refdes(dataset_key):
+    name = dataset_key.rsplit("/", 1)[-1]
+    prefix = max((p for p in CURATED_REFDES if name.startswith(p)), key=len, default=None)
     return CURATED_REFDES.get(prefix)
 
 
@@ -520,7 +539,7 @@ class CuratedPanel(PanelBase):
         super().__init__(on_remove)
         datasets = discover_curated()
         self.dataset_select = pn.widgets.Select(
-            name="Dataset", options=["-- Select --"] + list(datasets), width=480)
+            name="Dataset", groups={"": {"-- Select --": "-- Select --"}, **curated_groups(datasets)}, width=480)
         self.var_select = pn.widgets.Select(name="Variable", options=[], width=260)
         self.cmap_select = pn.widgets.Select(name="Colormap", options=CMAP_OPTIONS, width=130)
         self.mask_toggle = pn.widgets.Checkbox(name="Mask gaps", value=True)
@@ -997,7 +1016,7 @@ class MetadataPanel(PanelBase):
         self.source_select = pn.widgets.Select(
             name="Dataset", width=520,
             groups={"": ["-- Select --"],
-                    "Curated (cresst)": list(discover_curated()),
+                    "Curated": list(discover_curated()),
                     "OOI streams": list(SITES_DICT)})
         self.source_select.param.watch(self._changed, "value")
         self.layout = self.build_layout(self.source_select)
