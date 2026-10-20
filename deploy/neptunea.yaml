@@ -24,7 +24,7 @@ Parameters:
     Description: Latest Amazon Linux 2023 image, looked up at deploy time.
   RepoUrl:
     Type: String
-    Default: https://github.com/OOI-CabledArray/rca-panel-app.git
+    Default: https://github.com/OOI-CabledArray/neptunea.git
   Branch:
     Type: String
     Default: main

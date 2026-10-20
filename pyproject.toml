@@ -3,7 +3,7 @@ requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "rca-panel-app"
+name = "neptunea"
 version = "0.1.0"
 description = "Neptunea: interactive Panel app for verifying OOI Regional Cabled Array data products"
 requires-python = ">=3.10"
