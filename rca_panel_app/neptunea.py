@@ -82,6 +82,13 @@ DATETIME_OPTS = dict(
     xformatter=DatetimeTickFormatter(months="%b %Y", years="%Y", days="%d %b"),
     xticks=DatetimeTicker(desired_num_ticks=12),
 )
+# Every plot has time on x: the scroll wheel zooms time only (box zoom still
+# does both axes). Set per element type, since each overlay layer contributes
+# its own default tools.
+hv.opts.defaults(*(
+    getattr(hv.opts, el)(default_tools=["save", "pan", "xwheel_zoom", "box_zoom", "reset"],
+                         active_tools=["pan", "xwheel_zoom"])
+    for el in ("Image", "QuadMesh", "Scatter", "Curve", "VSpans", "VLines", "Area")))
 CMAP_OPTIONS = sorted(m for m in cmocean.cm.cmap_d if not m.endswith("_r"))
 # rca-data-tools time-machine palette, indexed by years-back
 # HITL annotation spans, cycled in time order so neighbors/overlaps differ;
@@ -407,6 +414,8 @@ STREAM_LAYERS = {  # QARTOD rollup flag value -> image style
     "4":  dict(cmap=["#d62728"]),
 }
 FLAG_NAMES = {"3": "QARTOD suspect", "4": "QARTOD fail"}
+QARTOD_LABELS = {"1": "pass", "2": "not evaluated", "3": "suspect", "4": "fail", "9": "missing"}
+POINT_COLOR = "#08306b"  # unflagged detail points; orange/red mean suspect/fail only
 
 
 def flag_legend(flags, t0):
@@ -508,24 +517,33 @@ def stream_layer(refdes, var, flag, label, overview_y):
     return hv.DynamicMap(view, streams=[hv.streams.RangeXY()])
 
 
-def detail_layer(refdes, var, label):
-    """Real, hoverable points once the window holds < DETAIL_THRESHOLD samples."""
-    idx = get_dataset(_stream_path(refdes)).indexes["time"]
+def detail_layer(refdes, var, label, show_flags):
+    """Real, hoverable points once the window holds < DETAIL_THRESHOLD samples.
+    Navy unless `show_flags`, then suspect/fail points take the flag colors."""
+    ds = get_dataset(_stream_path(refdes))
+    idx, fcol = ds.indexes["time"], flag_col(ds, var)
     hover = HoverTool(
-        tooltips=[("time", "@time{%F %H:%M:%S}"), (label, "@value")],
+        tooltips=[("time", "@time{%F %H:%M:%S}"), (label, "@value"), ("QARTOD", "@flag")],
         formatters={"@time": "datetime"},
     )
+    flag_colors = {f: STREAM_LAYERS[f]["cmap"][0] for f in FLAG_NAMES} if show_flags else {}
 
     def points(x_range, y_range):
-        data = ([], [])
+        data = pd.DataFrame({"time": pd.to_datetime([]), "value": [], "flag": [], "color": []})
         if x_range is not None:
             lo = idx.searchsorted(_to_timestamp(x_range[0]))
             hi = idx.searchsorted(_to_timestamp(x_range[1]))
             if 0 < hi - lo <= DETAIL_THRESHOLD:
                 df = load_slice(refdes, var, int(lo), int(hi), 1)  # true points
-                data = (df["time"].values, df[var].values)
-        return hv.Scatter(data, "time", "value").opts(
-            color="crimson", size=5, tools=[hover])
+                flags = (df[fcol].astype(str).str.strip() if fcol
+                         else pd.Series("", index=df.index))
+                data = pd.DataFrame({
+                    "time": df["time"], "value": df[var],
+                    "flag": flags.map(QARTOD_LABELS).fillna("n/a"),
+                    "color": flags.map(flag_colors).fillna(POINT_COLOR),
+                })
+        return hv.Scatter(data, "time", ["value", "flag", "color"]).opts(
+            color="color", line_color="white", line_width=0.5, size=6, tools=[hover])
 
     return hv.DynamicMap(points, streams=[hv.streams.RangeXY()])
 
@@ -857,7 +875,7 @@ class StreamPanel(PanelBase):
             plot = main
             for f in flags[1:]:
                 plot = plot * stream_layer(refdes, var, f, label, overview_y)
-            plot = plot * detail_layer(refdes, var, label)
+            plot = plot * detail_layer(refdes, var, label, len(flags) > 1)
             if flags[1:]:
                 plot = plot * flag_legend(flags[1:], ds.indexes["time"][0])
             if self.clim_toggle.value:
