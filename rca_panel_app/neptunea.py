@@ -1102,7 +1102,8 @@ class AnnotationBrowser(PanelBase):
             self.clear()
             return
         def show(df):
-            cols = [c for c in ["beginDT", "endDT", "annotation", "qcFlag", "source"] if c in df]
+            # `source` (annotator emails) is left out: the dashboard is public
+            cols = [c for c in ["beginDT", "endDT", "annotation", "qcFlag"] if c in df]
             self.plot_pane.value = df[cols] if not df.empty else pd.DataFrame()
             self.count.object = f"**{len(df)} annotations**"
         self.run(lambda: fetch_annotations(event.new), apply=show)

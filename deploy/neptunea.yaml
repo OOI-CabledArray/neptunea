@@ -1,15 +1,24 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
-  Neptunea: one EC2 server running the Panel app, a fixed public IP,
-  and a weekday start/stop schedule. See deploy/README.md.
+  Neptunea: one EC2 server running the Panel app behind Caddy (HTTPS via
+  Let's Encrypt) at a Route 53 name, and a weekday start/stop schedule.
+  See deploy/README.md.
 
 Parameters:
+  DomainName:
+    Type: String
+    Default: neptunea.ooi-rca.net
+  HostedZoneName:
+    Type: String
+    Default: ooi-rca.net.
+    Description: Existing Route 53 zone for DomainName (trailing dot).
   AllowedCidr:
     Type: String
+    Default: 0.0.0.0/0
     Description: >-
-      IP range allowed to open the app, e.g. your campus/VPN range
-      (x.x.x.x/16) or a single office IP (x.x.x.x/32). The app has no login,
-      so keep this narrow.
+      Who can reach ports 80/443. Let's Encrypt must reach port 80 to issue
+      and renew the certificate, so restricting this breaks HTTPS unless the
+      certificate setup changes (see deploy/README.md).
     AllowedPattern: '^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$'
   InstanceType:
     Type: String
@@ -46,16 +55,14 @@ Parameters:
     Description: DISABLED leaves the server in whatever state it is in (e.g. running 24/7).
 
 Resources:
-  # --- Network access: HTTP from AllowedCidr only; admin via Session Manager (no SSH)
+  # --- Network access: HTTP/HTTPS from AllowedCidr; admin via Session Manager (no SSH)
   SecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupDescription: Neptunea web access
       SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 80
-          ToPort: 80
-          CidrIp: !Ref AllowedCidr
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: !Ref AllowedCidr}
+        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: !Ref AllowedCidr}
 
   # Fixed address so the URL survives stop/start
   ElasticIP:
@@ -69,6 +76,15 @@ Resources:
     Properties:
       AllocationId: !GetAtt ElasticIP.AllocationId
       InstanceId: !Ref Instance
+
+  DnsRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneName: !Ref HostedZoneName
+      Name: !Ref DomainName
+      Type: A
+      TTL: "300"
+      ResourceRecords: [!Ref ElasticIP]
 
   # --- Server permissions: Session Manager, read /neptunea/* settings, read data buckets
   InstanceRole:
@@ -105,8 +121,9 @@ Resources:
     Properties:
       Roles: [!Ref InstanceRole]
 
-  # --- The server. First boot installs git + uv and a systemd service; every
-  # service start pulls the branch, syncs the locked env, and serves on port 80.
+  # --- The server. First boot installs git, uv, Caddy and two systemd services.
+  # Caddy terminates HTTPS for DomainName and proxies to the app on localhost:5006;
+  # every app start pulls the branch, syncs the locked env, and serves.
   Instance:
     Type: AWS::EC2::Instance
     Properties:
@@ -116,7 +133,7 @@ Resources:
       SecurityGroupIds: [!GetAtt SecurityGroup.GroupId]
       BlockDeviceMappings:
         - DeviceName: /dev/xvda
-          Ebs: {VolumeSize: 30, VolumeType: gp3}
+          Ebs: {VolumeSize: 30, VolumeType: gp3, Encrypted: true}
       Tags: [{Key: Name, Value: neptunea}]
       UserData:
         Fn::Base64: !Sub |
@@ -125,6 +142,42 @@ Resources:
           dnf install -y git tar
           curl -LsSf https://astral.sh/uv/0.9.7/install.sh | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh
           useradd --system --create-home --home-dir /opt/neptunea neptunea
+
+          # Caddy: HTTPS via Let's Encrypt in front of the app (same setup as qaqc.ooi-rca.net)
+          # pinned release, verified against its published SHA-512 (update version + sums together)
+          CADDY=caddy_2.11.7_linux_$(uname -m | sed 's/aarch64/arm64/; s/x86_64/amd64/').tar.gz
+          curl -LsSfo /tmp/$CADDY https://github.com/caddyserver/caddy/releases/download/v2.11.7/$CADDY
+          grep " $CADDY$" > /tmp/caddy.sha512 <<'EOF'
+          3db36ba90c7a6e8dda40ee3dd71fa08844c76b5fb08f61b31e5e78d2ed38e71c51dc7baed875e50d1ca1279196e84302967237386ae87c91ae9f2aaceada682e  caddy_2.11.7_linux_arm64.tar.gz
+          a7a433a1b133efc3c8d10eb0b99d52a24b5ef5c322dc77f5282182b1c0402139ab83f3a99f0c52409df77d20123fb0b523edad8a66d8f5e49136197bf61ef0e7  caddy_2.11.7_linux_amd64.tar.gz
+          EOF
+          (cd /tmp && sha512sum -c caddy.sha512)
+          tar -xzf /tmp/$CADDY -C /usr/local/bin caddy
+          useradd --system --create-home --home-dir /var/lib/caddy caddy
+          mkdir -p /etc/caddy
+          cat > /etc/caddy/Caddyfile <<'EOF'
+          ${DomainName} {
+              redir / /neptunea
+              reverse_proxy localhost:5006
+          }
+          EOF
+          cat > /etc/systemd/system/caddy.service <<'EOF'
+          [Unit]
+          Description=Caddy
+          Wants=network-online.target
+          After=network-online.target
+
+          [Service]
+          Type=notify
+          User=caddy
+          ExecStart=/usr/local/bin/caddy run --environ --config /etc/caddy/Caddyfile
+          ExecReload=/usr/local/bin/caddy reload --config /etc/caddy/Caddyfile --force
+          AmbientCapabilities=CAP_NET_BIND_SERVICE
+          Restart=on-failure
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
 
           cat > /usr/local/bin/neptunea-start <<'EOF'
           #!/bin/bash
@@ -151,7 +204,7 @@ Resources:
           done < <(aws ssm get-parameters-by-path --path /neptunea/env/ --with-decryption \
                      --query 'Parameters[].[Name,Value]' --output text)
           exec .venv/bin/panel serve rca_panel_app/neptunea.py \
-            --address 0.0.0.0 --port 80 --allow-websocket-origin "$ORIGIN"
+            --address 127.0.0.1 --port 5006 --use-xheaders --allow-websocket-origin "$ORIGIN"
           EOF
           chmod 755 /usr/local/bin/neptunea-start
 
@@ -163,10 +216,9 @@ Resources:
 
           [Service]
           User=neptunea
-          Environment=REPO=${RepoUrl} BRANCH=${Branch} ORIGIN=${ElasticIP} AWS_DEFAULT_REGION=${AWS::Region}
+          Environment=REPO=${RepoUrl} BRANCH=${Branch} ORIGIN=${DomainName} AWS_DEFAULT_REGION=${AWS::Region}
           Environment=PATH=/usr/local/bin:/usr/bin:/bin
           ExecStart=/usr/local/bin/neptunea-start
-          AmbientCapabilities=CAP_NET_BIND_SERVICE
           Restart=on-failure
           RestartSec=10
 
@@ -174,7 +226,7 @@ Resources:
           WantedBy=multi-user.target
           EOF
           systemctl daemon-reload
-          systemctl enable --now neptunea
+          systemctl enable --now neptunea caddy
 
   # --- Weekday schedule
   SchedulerRole:
@@ -224,6 +276,6 @@ Resources:
 Outputs:
   Url:
     Description: Share this with coworkers
-    Value: !Sub http://${ElasticIP}/neptunea
+    Value: !Sub https://${DomainName}
   InstanceId:
     Value: !Ref Instance
