@@ -5,47 +5,48 @@ Cabled Array data — hover and zoom to pinpoint when a data problem starts.
 Companion to [rca-data-tools](https://github.com/OOI-CabledArray/rca-data-tools).
 Named for *Neptunea*, a slow-moving marine snail.
 
+Hosted at **https://neptunea.ooi-rca.net** (weekdays 7am–7pm Pacific);
+see [deploy/README.md](deploy/README.md).
+
 ## Tabs
 
-- **Curated Products** — curated zarr products from every folder in
-  `rca-advanced-qaqc` (`cresst/`, `cresst-one-easy-rca/`, …; new products appear
-  within 10 min) as heatmaps (profilers) or time series (fixed moorings).
-  Hover, cmocean colormap selector, gap masking, deployment markers,
-  side-by-side comparison panels. Heatmap color range:
-  drag or type the min/max, reset to the params standard, or fit to the
-  2–98th percentile of the zoomed view — all without losing zoom.
-- **Full Time Series** — any `ooi-data` stream at native resolution. Hover at
-  every zoom level; cached overview → windowed re-aggregation → points once
-  sparse. Y-range: params standard, or Auto (middle 98% of values, so
-  spikes don't flatten the view). Overlays: annotations, deployments, QARTOD
-  flags, climatology. Draft an M2M annotation payload to copy (never POSTs):
-  box-select tool + drag sets the time range; includes the variable's OOI
-  parameter ID and your name/email as source.
+- **Curated Products** — zarr products from every folder in `rca-advanced-qaqc`
+  (`cresst/`, `cresst-one-easy-rca/`, …) as heatmaps (profilers) or time
+  series (fixed moorings). Colormap, gap masking, deployment markers,
+  side-by-side panels. Heatmap color range: drag/type, params standard, or
+  fit to the zoomed view.
+- **Full Time Series** — any `ooi-data` stream at native resolution, hoverable
+  at every zoom. Y-range: params standard or Auto (middle 98%, so spikes don't
+  flatten the view). Overlays: annotations, deployments, QARTOD flags,
+  climatology. Box-select a time range to draft an M2M annotation payload to
+  copy (never POSTs).
 - **Time Machine** — year-over-year overlay of fixed products and streams.
 - **Annotations** — searchable HITL annotation table per refdes.
 - **Metadata** — xarray notebook-style repr for any store.
 
-## Install & run
+## Run locally
 
 ```bash
-uv run neptunea            # installs the locked env (uv.lock) on first run
-# or: pip install -e . && neptunea
+uv run neptunea                                                    # app
+uv run panel serve rca_panel_app/neptunea.py --autoreload --show   # dev, reloads on save
 ```
 
 Needs AWS credentials for S3; `OOI_USERNAME`/`OOI_TOKEN` (env or `.env`) for
-annotation/deployment features. After changing dependencies in
-`pyproject.toml`, run `uv lock` and commit `uv.lock`.
+annotations, deployments and annotation parameter IDs.
 
-Hosted deployment (EC2 on a weekday schedule): see [deploy/README.md](deploy/README.md).
+Dependencies: edit `pyproject.toml`, run `uv lock` (`uv lock --upgrade` to
+update packages), test, and commit both files — the server installs exactly
+what `uv.lock` pins.
 
 ## Notes
 
 - Plot standards come from rca-data-tools `params/` (local checkout, else
   GitHub raw); climatology from `~/repos/qc-lookup` QARTOD tables.
-- Caching: annotations refresh every 10 min; curated variables load into memory; stream overviews cached per
-  instrument/variable/flag after one full scan (~2 min, off the event loop).
-- Time machine shifts prior years by 365-day multiples (~1 day leap drift
-  per 4 years, faithful to rca-data-tools).
+- Caching: curated product list and annotations refresh every 10 min; curated
+  variables load into memory; stream overviews are cached per
+  instrument/variable/flag/y-range after one full scan (~2 min).
+- Time Machine shifts prior years by 365-day multiples (~1 day leap drift per
+  4 years, as in rca-data-tools).
 
 ## Roadmap
 
