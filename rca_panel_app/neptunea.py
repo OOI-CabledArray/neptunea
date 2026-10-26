@@ -226,7 +226,7 @@ def annotation_overlay(refdes):
     df = fetch_annotations(refdes)
     if df.empty:
         return hv.VSpans(([], [], []), vdims=["annotation"])
-    end = df["endDT"].fillna(pd.Timestamp.now())
+    end = df["endDT"].fillna(pd.Timestamp.now("UTC").tz_localize(None))
     text = df["annotation"].fillna("")
     spans = pd.DataFrame({
         "begin": df["beginDT"], "end": end,
@@ -745,6 +745,14 @@ class StreamPanel(PanelBase):
         self.flags_toggle = pn.widgets.Checkbox(name="QARTOD flags", value=False)
         self.clim_toggle = pn.widgets.Checkbox(name="Climatology", value=False)
         self.info_pane = pn.pane.Alert("", alert_type="primary", visible=False)
+        # selectable stream name + copy-to-clipboard button
+        self.stream_text = pn.widgets.TextInput(
+            width=440, visible=False, styles={"font-family": "monospace"})
+        self.copy_btn = pn.widgets.ButtonIcon(
+            icon="clipboard", active_icon="check", toggle_duration=1000,
+            description="Copy stream name", visible=False, align="center")
+        self.copy_btn.js_on_click(args={"src": self.stream_text},
+                                  code="navigator.clipboard.writeText(src.value)")
         # zoom re-aggregation runs in the RangeXY callback (not run()); mirror
         # the server-busy flag so a spinner marks "thinking" vs. "stuck".
         self.zoom_busy = pn.indicators.LoadingSpinner(
@@ -765,7 +773,8 @@ class StreamPanel(PanelBase):
         self.layout = self.build_layout(
             self.refdes_select, self.var_select, self.yrange_radio, self.zoom_busy)
         self.layout.insert(1, pn.Row(self.anno_toggle, self.deploy_toggle,
-                                     self.flags_toggle, self.clim_toggle))
+                                     self.flags_toggle, self.clim_toggle,
+                                     self.stream_text, self.copy_btn, align="center"))
         self.layout.insert(2, self.info_pane)
         self.layout.append(self.draft_card)
 
@@ -779,8 +788,8 @@ class StreamPanel(PanelBase):
 
     # -- annotation drafting --
     def _init_draft(self):
-        self.draft_begin = pn.widgets.DatetimePicker(name="Begin", width=200)
-        self.draft_end = pn.widgets.DatetimePicker(name="End", width=200)
+        self.draft_begin = pn.widgets.DatetimePicker(name="Begin (UTC)", width=200)
+        self.draft_end = pn.widgets.DatetimePicker(name="End (UTC)", width=200)
         self.draft_flag = pn.widgets.Select(
             name="qcFlag", options=QC_FLAG_OPTIONS, value="suspect", width=150)
         self.draft_text = pn.widgets.TextAreaInput(
@@ -838,7 +847,10 @@ class StreamPanel(PanelBase):
 
     # -- data/plot --
     def _refdes_changed(self, event):
-        if event.new not in SITES_DICT:
+        known = event.new in SITES_DICT
+        self.stream_text.value = SITES_DICT[event.new]["zarr"] if known else ""
+        self.stream_text.visible = self.copy_btn.visible = known
+        if not known:
             self.var_select.options = []
             self.clear()
             self.info_pane.visible = False
