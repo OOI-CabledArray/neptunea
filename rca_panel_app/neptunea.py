@@ -166,7 +166,7 @@ def discover_curated():
     """Curated *.zarr products in every top-level folder of the bucket
     (cresst/, cresst-one-easy-rca/, ...), keyed "folder/name.zarr". Folders
     that are themselves zarr stores (advanced-QC instrument streams) are skipped."""
-    fs.invalidate_cache(CURATED_BUCKET)
+    fs.invalidate_cache()  # a path arg only clears that path and its parents, not subfolders
     paths = []
     for d in fs.ls(CURATED_BUCKET, detail=True):
         folder = d["name"]
