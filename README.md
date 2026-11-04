@@ -10,11 +10,26 @@ see [deploy/README.md](deploy/README.md).
 
 ## Tabs
 
-- **Curated Products** — zarr products from every folder in `rca-advanced-qaqc`
-  (`cresst/`, `cresst-one-easy-rca/`, …) as heatmaps (profilers) or time
-  series (fixed moorings). Colormap, gap masking, deployment markers,
-  side-by-side panels. Heatmap color range: drag/type, params standard, or
-  fit to the zoomed view.
+- **Curated Products** — CRESST releases listed by `catalog.json` /
+  `manifest.json` in `rca-advanced-qaqc` (`cresst-one-easy-rca/`, newest
+  first), plus zarr products in folders without a catalog (`cresst/`), as
+  heatmaps (profilers) or time series (fixed moorings). Colormap, gap masking,
+  deployment markers, side-by-side panels. Heatmap color range: drag/type,
+  params standard, or fit to the zoomed view.
+  - **Compare** against the same product at a lower QC level (`ooi` → `qartod`
+    → `hitl` → `advanced`), another release/build, or another product in the
+    same release. Time series: the comparison in gray, points only one side has
+    colored (removed by QARTOD / HITL + adjustments / advanced pH, or only in
+    one build), and an A − B panel when the grids overlap. Heatmaps: both
+    products with linked zoom, plus a changes panel for builds/levels of one
+    product.
+  - **Annotations** — HITL annotations and adjustments colored by curation
+    decision (mask / ignore / superseded / adjustment; legend toggles each),
+    rationale on hover. Releases use their own `annotations.csv` /
+    `adjustments.csv` and the per-variable `hitl_masks` attribute (node
+    wildcards and salinity inheritance resolved); older builds use
+    [rca-cicoes-cresst](https://github.com/ooi-data/rca-cicoes-cresst) main and
+    warn when the ledger has changed since the build.
 - **Full Time Series** — any `ooi-data` stream at native resolution, hoverable
   at every zoom. Y-range: params standard or Auto (middle 98%, so spikes don't
   flatten the view). Overlays: annotations, deployments, QARTOD flags,
@@ -42,7 +57,8 @@ what `uv.lock` pins.
 
 - Plot standards come from rca-data-tools `params/` (local checkout, else
   GitHub raw); climatology from `~/repos/qc-lookup` QARTOD tables.
-- Caching: curated product list and annotations refresh every 10 min; curated
+- Caching: curated product list and annotations refresh every 10 min; release
+  manifests and files are kept until restart (releases are immutable); curated
   variables load into memory; stream overviews are cached per
   instrument/variable/flag/y-range after one full scan (~2 min).
 - Time Machine shifts prior years by 365-day multiples (~1 day leap drift per
@@ -55,3 +71,14 @@ what `uv.lock` pins.
 3. Annotation table row → plot span linking
 4. `localRanges.yaml` as a third y-range option
 5. Persist stream overview caches to disk
+6. Nearest-neighbor comparison tab
+   - Pick an instrument; neighbors listed from `sitesDictionary.csv` (`nearestNeighbors`)
+   - Overlay of both series on a shared hourly-median grid, plus a difference panel with deployment markers
+   - Variables paired by `variableParameters.csv` standard names (e.g. PHSENH `ph_total` ↔ PHSEN `ph_seawater`)
+   - Prototype on hard-coded pairs for science-lead review, then restore the `nearestNeighbors` column
+   - Candidate pairs: co-located CTDs, PHSENH ↔ PHSEN, shallow-profiler CTD ↔ 200 m platform CTD, CTD oxygen ↔ standalone optodes
+   - Once pairs settle: PNGs per pair in the static dashboard, and a Prefect difference check feeding alerts
+7. Curation review: follow the rca-cicoes-cresst release work
+   - Before/after curation lights up once a release publishes `ooi` / `qartod` levels
+   - Check `hitl_masks` spans against the first release that carries them (v2026.10 doesn't)
+   - Release notes and `build_report.json` (% removed per level and year) beside a build comparison, filtered to the variable

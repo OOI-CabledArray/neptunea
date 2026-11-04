@@ -4,6 +4,10 @@ Five tabs:
   1. Curated Products — verify CRESST curated zarr products (profiler heatmaps,
      fixed-mooring time series) with lock-on hover and full-res zoom.
      Heatmap color range is adjustable live (drag/type, standard, fit to view).
+     Products come from CRESST release manifests (catalog.json) where a
+     folder has them. Compare with a lower QC level, another release/build,
+     or another product, and overlay the curation decisions (HITL ledger,
+     adjustments) behind it.
   2. Full Time Series — any stream from the ooi-data bucket (menu from
      rca-data-tools sitesDictionary.csv). Three-tier rendering: cached
      full-range overview, windowed re-aggregation on zoom, individual
@@ -28,9 +32,12 @@ annotation features.
 import panel as pn
 pn.extension('tabulator', loading_spinner='dots')
 
+import io
 import os
+import re
 import ast
 import json
+import hashlib
 import datetime
 import asyncio
 import traceback
@@ -65,15 +72,9 @@ OOI_AUTH = (os.getenv("OOI_USERNAME", ""), os.getenv("OOI_TOKEN", ""))
 
 QC_LOOKUP = Path.home() / "repos/qc-lookup/qartod"
 
-# CTD refdes per curated product prefix (for deployment markers); longest match wins
-CURATED_REFDES = {
-    "axial_base_deep":      "RS03AXPD-DP03A-01-CTDPFL304",
-    "axial_base":           "RS03AXPS-SF03A-2A-CTDPFA302",
-    "slope_base_deep":      "RS01SBPD-DP01A-01-CTDPFL104",
-    "slope_base":           "RS01SBPS-SF01A-2A-CTDPFA102",
-    "oregon_offshore_deep": "CE04OSPD-DP01B-01-CTDPFL105",
-    "oregon_offshore":      "CE04OSPS-SF01B-2A-CTDPFA107",
-}
+# Curated-product config (instruments per product, HITL ledger, adjustments)
+CRESST_LOCAL = Path.home() / "repos/rca-cicoes-cresst"
+CRESST_URL = "https://raw.githubusercontent.com/ooi-data/rca-cicoes-cresst/main"
 
 PARAMS_LOCAL = Path.home() / "repos/rca-data-tools/rca_data_tools/qaqc/params"
 PARAMS_URL = "https://raw.githubusercontent.com/OOI-CabledArray/rca-data-tools/main/rca_data_tools/qaqc/params"
@@ -161,28 +162,189 @@ def select_first(select, options, refresh):
 
 
 # --- Data access ---
-@pn.cache(ttl=600)  # pick up newly written products
+@pn.cache  # releases are immutable
+def manifest(folder, release):
+    return json.loads(fs.cat(f"{CURATED_BUCKET}/{folder}/releases/{release}/manifest.json"))
+
+
+@pn.cache  # releases are immutable
+def release_csv(folder, release, name):
+    """A CSV published with a release (annotations.csv, adjustments.csv, ...)."""
+    return pd.read_csv(io.BytesIO(fs.cat(f"{CURATED_BUCKET}/{folder}/releases/{release}/{name}")))
+
+
+@pn.cache(ttl=600)  # pick up newly written products and releases
 def discover_curated():
-    """Curated *.zarr products in every top-level folder of the bucket
-    (cresst/, cresst-one-easy-rca/, ...), keyed "folder/name.zarr". Folders
-    that are themselves zarr stores (advanced-QC instrument streams) are skipped."""
+    """Curated products in every top-level folder of the bucket -> zarr path.
+    Folders with a catalog.json are read from their release manifests, newest
+    release first, keyed "folder/release/product/level"; other folders are
+    listed for *.zarr, keyed "folder/name.zarr". Folders that are themselves
+    zarr stores (advanced-QC instrument streams) are skipped."""
     fs.invalidate_cache()  # a path arg only clears that path and its parents, not subfolders
-    paths = []
+    found = {}
     for d in fs.ls(CURATED_BUCKET, detail=True):
         folder = d["name"]
         if d["type"] != "directory" or fs.exists(f"{folder}/.zgroup") or fs.exists(f"{folder}/zarr.json"):
             continue
-        paths += fs.glob(f"{folder}/*.zarr") + fs.glob(f"{folder}/*/*.zarr")
-    return {p.removeprefix(f"{CURATED_BUCKET}/"): p for p in sorted(paths)}
+        name = folder.removeprefix(f"{CURATED_BUCKET}/")
+        if fs.exists(f"{folder}/catalog.json"):
+            for rel in json.loads(fs.cat(f"{folder}/catalog.json"))["releases"]:
+                m = manifest(name, rel["id"])
+                base = m["base_url"].removeprefix("s3://")
+                found |= {f"{name}/{rel['id']}/{p['product']}/{p['level']}": base + p["files"]["zarr"]
+                          for p in m["products"]}
+        else:
+            found |= {p.removeprefix(f"{CURATED_BUCKET}/"): p
+                      for p in sorted(fs.glob(f"{folder}/*.zarr") + fs.glob(f"{folder}/*/*.zarr"))}
+    return dict(sorted(found.items(), key=lambda kv: not release_of(kv[0])))  # releases first
+
+
+# QC levels, cumulative, lowest first (rca-cicoes-cresst spec §6). Older flat
+# builds carry the level as a name token (phadv before its prefix).
+QC_LEVELS = ["ooi", "qartod", "hitl", "advanced", "deploymentcorrected"]
+LEGACY_TOKENS = {"qf49_HITL_phadv": "advanced", "qf49_HITL": "hitl"}
+LEVEL_STEPS = {  # what each level adds, and the color of points it removes
+    "qartod": ("QARTOD", "#ff8c00"),
+    "hitl": ("HITL + adjustments", "#d62728"),
+    "advanced": ("advanced pH", "#9467bd"),
+    "deploymentcorrected": ("deployment corrections", "#8c564b"),
+}
+
+
+def release_of(key):
+    """(folder, release id) of a release product key, else None."""
+    m = re.fullmatch(r"([^/]+)/(v[^/]+)/[^/]+/[^/]+", key)
+    return m.groups() if m else None
+
+
+def product_key(key):
+    """(build, product, QC level) of a curated key, so builds and levels of one
+    product match. Release keys carry all three:
+    'cresst-one-easy-rca/v2026.10/axial_base_fixed_1h/hitl'
+    -> ('cresst-one-easy-rca/v2026.10', 'axial_base_fixed_1h', 'hitl').
+    Older flat builds drop dates and the level token from the name:
+    'cresst/axial_base_fixed_20150101_20260708_1h_qf49_HITL.zarr'
+    -> ('cresst', 'axial_base_fixed_1h', 'hitl')."""
+    if release_of(key):
+        return tuple(key.rsplit("/", 2))
+    folder, _, name = key.rpartition("/")
+    stem = re.sub(r"_\d{8}_\d{8}", "", name.removesuffix(".zarr"))
+    for token, level in LEGACY_TOKENS.items():
+        if f"_{token}" in stem:
+            return folder, stem.replace(f"_{token}", "", 1), level
+    return folder, stem, "ooi"
+
+
+def menu_label(key):
+    """Name within its build: 'product · level' for releases, else the file name."""
+    _, product, level = product_key(key)
+    return f"{product} · {level}" if release_of(key) else key.rpartition("/")[2]
 
 
 def curated_groups(keys):
-    """Select groups per bucket folder: {folder: {product name: key}}."""
+    """Select groups per build: {build: {name: key}}."""
     groups = {}
     for k in keys:
-        folder, _, name = k.partition("/")
-        groups.setdefault(folder, {})[name] = k
+        groups.setdefault(product_key(k)[0], {})[menu_label(k)] = k
     return groups
+
+
+def build_label(key):
+    """Release id, or an older build's folder plus the dates in the name:
+    'cresst (20150101–20260708)'."""
+    if rel := release_of(key):
+        return rel[1]
+    folder, _, name = key.rpartition("/")
+    dates = re.search(r"_(\d{8})_(\d{8})", name)
+    return f"{folder} ({dates[1]}–{dates[2]})" if dates else folder
+
+
+def compare_groups(key, keys):
+    """Compare-select groups for `key`: the same product at lower QC levels of
+    the same build, the same product and level in other builds, then other
+    products of the same build."""
+    build, product, level = product_key(key)
+    groups = {"": {"None": ""}}
+    for k in keys:
+        b, p, lvl = product_key(k)
+        if k == key:
+            continue
+        if (b, p) == (build, product) and QC_LEVELS.index(lvl) < QC_LEVELS.index(level):
+            groups.setdefault("Lower QC level", {})[lvl] = k
+        elif (p, lvl) == (product, level):
+            groups.setdefault("Other builds", {})[build_label(k)] = k
+        elif b == build:
+            groups.setdefault("Other products", {})[menu_label(k)] = k
+    return groups
+
+
+def compare_arrays(key_a, key_b, var, datasets):
+    """What to draw when comparing curated product A with B for `var`:
+    B itself, points B has that A lacks (`removed`) and the reverse (`added`),
+    and A − B (1D) where the grids overlap. A lower level of the same build is
+    split by QC step, walking every level published in between; another build
+    of the same product is compared only over the shared time span, so a
+    longer record doesn't count as a difference."""
+    (fa, pa, la), (fb, pb, lb) = product_key(key_a), product_key(key_b)
+    a, b = load_var(datasets[key_a], var), load_var(datasets[key_b], var)
+    tdim = time_dim(a)
+    removed, added = [], []
+    if (fa, pa) == (fb, pb):
+        levels = {product_key(k)[2]: k for k in datasets if product_key(k)[:2] == (fa, pa)}
+        chain = [lvl for lvl in QC_LEVELS[QC_LEVELS.index(lb):QC_LEVELS.index(la) + 1] if lvl in levels]
+        for lo, hi in zip(chain, chain[1:]):
+            steps = QC_LEVELS[QC_LEVELS.index(lo) + 1:QC_LEVELS.index(hi) + 1]
+            before, after = xr.align(load_var(datasets[levels[lo]], var),
+                                     load_var(datasets[levels[hi]], var), join="outer")
+            removed.append(("removed by " + " + ".join(LEVEL_STEPS[s][0] for s in steps),
+                            LEVEL_STEPS[hi][1], before.where(after.isnull())))
+        label_a, label_b = la, lb
+    else:
+        label_a, label_b = ((build_label(key_a), build_label(key_b)) if pa == pb
+                            else (menu_label(key_a), menu_label(key_b)))
+        if pa == pb:
+            span = slice(max(a[tdim].values[0], b[tdim].values[0]), min(a[tdim].values[-1], b[tdim].values[-1]))
+            a_s, b_s = xr.align(a.sel({tdim: span}), b.sel({tdim: span}), join="outer")
+            removed = [(f"only in {label_b}", "#CC79A7", b_s.where(a_s.isnull()))]
+            added = [(f"only in {label_a}", "#009E73", a_s.where(b_s.isnull()))]
+    diff = None
+    if a.ndim == 1:
+        a2, b2 = xr.align(a, b, join="inner")
+        if a2.sizes[tdim] >= 0.5 * min(a.sizes[tdim], b.sizes[tdim]):
+            diff = (a2 - b2).rename("difference")
+    return dict(b=b, label_a=label_a, label_b=label_b, removed=removed, added=added,
+                diff=diff, same_product=pa == pb)
+
+
+# --- rca-cicoes-cresst config: instruments per product, HITL ledger, adjustments
+@pn.cache(ttl=600)  # ledger decisions and harvests change between builds
+def cresst_file(path):
+    """Bytes of a file in rca-cicoes-cresst: local checkout, else GitHub main."""
+    local = CRESST_LOCAL / path
+    if local.exists():
+        return local.read_bytes()
+    resp = requests.get(f"{CRESST_URL}/{path}", timeout=30)
+    resp.raise_for_status()
+    return resp.content
+
+
+def cresst_csv(path, **kw):
+    return pd.read_csv(io.BytesIO(cresst_file(path)), **kw)
+
+
+def ledger_sha():
+    """Matches a product's `hitl_ledger_sha1` when built from this ledger."""
+    return hashlib.sha1(cresst_file("annotations/ledger.csv")).hexdigest()[:10]
+
+
+def product_instruments(key):
+    """sites.csv rows for the instruments feeding a curated product."""
+    sites = cresst_csv("config/sites.csv", comment="#")
+    m = re.match(r"(.+?)_(fixed|profiles)", product_key(key)[1])
+    if not m:
+        return sites.iloc[:0]
+    kind = "fixed" if m[2] == "fixed" else "profiler"
+    return sites[(sites.site == m[1]) & (sites["product"] == kind)]
 
 
 @pn.cache
@@ -227,10 +389,9 @@ def annotation_overlay(refdes):
     if df.empty:
         return hv.VSpans(([], [], []), vdims=["annotation"])
     end = df["endDT"].fillna(pd.Timestamp.now("UTC").tz_localize(None))
-    text = df["annotation"].fillna("")
     spans = pd.DataFrame({
         "begin": df["beginDT"], "end": end,
-        "annotation": text.where(text.str.len() <= 400, text.str.slice(0, 400) + "…"),
+        "annotation": _truncate(df["annotation"]),
         "flag": df["qcFlag"].fillna("no flag"),
         "dates": df["beginDT"].dt.strftime("%Y-%m-%d") + " → " + end.dt.strftime("%Y-%m-%d"),
         "color": [ANNO_COLORS[i % len(ANNO_COLORS)] for i in range(len(df))],
@@ -277,9 +438,98 @@ def deployment_overlay(refdes):
 
 
 def curated_refdes(dataset_key):
-    name = dataset_key.rsplit("/", 1)[-1]
-    prefix = max((p for p in CURATED_REFDES if name.startswith(p)), key=len, default=None)
-    return CURATED_REFDES.get(prefix)
+    """CTD feeding a curated product (deployment markers)."""
+    rows = product_instruments(dataset_key)
+    ctd = rows[rows.instrument == "ctd"].refdes
+    return ctd.iloc[0] if len(ctd) else None
+
+
+def _truncate(text, n=400):
+    text = text.fillna("")
+    return text.where(text.str.len() <= n, text.str.slice(0, n) + "…")
+
+
+DECISION_STYLE = {  # curation decision -> (span color, fill alpha)
+    "mask": ("#d62728", 0.15),
+    "mask (other variables)": ("#d62728", 0.04),
+    "ignore": ("#7f7f7f", 0.06),
+    "superseded": ("#CC79A7", 0.1),
+    "adjustment": ("#009E73", 0.15),
+}
+
+
+def curation_overlay(key, da):
+    """HITL annotations and adjustments behind a curated product's variable,
+    one legend entry per decision. Release products use the annotations.csv
+    and adjustments.csv published with them; older builds use rca-cicoes-cresst
+    main (ledger.csv, adjustments.csv). Annotations come from the product's
+    nodes; those on other instruments there are kept only when masked. Masks
+    applied to this variable come from its `hitl_masks` attribute when the
+    build records one (spec R25); without it, a mask counts when it names this
+    variable or one with the same params standard name, else shows as "mask
+    (other variables)"; node wildcards and salinity inheritance (R19–R20)
+    aren't resolved."""
+    rows = product_instruments(key)
+    refdes = set(rows.refdes) | set(rows.stitch_from.dropna())
+    subsites, nodes, sensors = map(set, zip(*(r.split("-", 2) for r in refdes)))
+    var, tdim = da.name, time_dim(da)
+    if rel := release_of(key):
+        anns, adj = release_csv(*rel, "annotations.csv"), release_csv(*rel, "adjustments.csv")
+    else:
+        anns = pd.concat([cresst_csv(f"annotations/raw/{s}.csv") for s in sorted(subsites)])
+        anns = anns.join(cresst_csv("annotations/ledger.csv").set_index("id")[
+            ["decision", "parameters_affected", "rationale"]], on="id", how="inner")
+        adj = cresst_csv("config/adjustments.csv")
+    applied = ({m["annotation_id"]: m for m in json.loads(da.attrs["hitl_masks"])}
+               if "hitl_masks" in da.attrs else None)
+    keep = (anns.subsite.isin(subsites) & (anns.node.isna() | anns.node.isin(nodes))
+            & (anns.sensor.isna() | anns.sensor.isin(sensors) | (anns.decision == "mask")))
+    anns = anns[keep | anns.id.isin(list(applied or ()))].reset_index(drop=True)
+
+    def decision(r):
+        if r.decision != "mask":
+            return r.decision
+        if applied is not None:
+            return "mask" if r.id in applied else "mask (other variables)"
+        params = ast.literal_eval(r.parameters_affected) if isinstance(r.parameters_affected, str) else []
+        # by params standard name too: stitched records keep the source sensor's
+        # variable name in the ledger (PHSENH ph_total feeds product ph_seawater)
+        same = var in params or VAR_TO_PARAM.get(var) in {VAR_TO_PARAM.get(p) for p in params} - {None}
+        return "mask" if not params or same else "mask (other variables)"
+
+    data_end = pd.Timestamp(da[tdim].values[-1])  # open-ended windows run to here
+    to_time = lambda s: pd.to_datetime(s, format="ISO8601", utc=True).dt.tz_localize(None)
+    spans = pd.DataFrame({
+        "begin": to_time(anns.beginDT),
+        "end": to_time(anns.endDT).fillna(data_end),
+        "decision": [decision(r) for r in anns.itertuples()],
+        "id": "#" + anns.id.astype(str),
+        "params": anns.parameters_affected.fillna("whole stream"),
+        "rationale": anns.rationale.fillna(""),
+        "annotation": _truncate(anns.annotation),
+    })
+    for i, m in (applied or {}).items():  # windows as applied by the build
+        hit = anns.id.values == i
+        spans.loc[hit, ["begin", "end"]] = to_time(pd.Series([m["begin"], m["end"]])).fillna(data_end).values
+        if m["via"] != "direct":
+            spans.loc[hit, "id"] += f" via {m['via']}"
+    adj = adj[adj.refdes.isin(refdes) & (adj.variable == var)]
+    spans = pd.concat([spans, pd.DataFrame({
+        "begin": to_time(adj.begin), "end": to_time(adj.end).fillna(data_end),
+        "decision": "adjustment", "id": "adjustment " + adj.id.astype(str),
+        "params": adj.action + " " + adj.variable, "rationale": adj.rationale.fillna(""),
+        "annotation": "",
+    })])
+    spans["dates"] = spans.begin.dt.strftime("%Y-%m-%d") + " → " + spans.end.dt.strftime("%Y-%m-%d")
+    hover = HoverTool(tooltips=(
+        '<div style="max-width:380px; white-space:normal">'
+        "<b>@decision</b> &middot; @id &middot; @dates<br><i>@params</i><br>@rationale<br>@annotation</div>"))
+    vdims = ["decision", "id", "params", "rationale", "annotation", "dates"]
+    return hv.Overlay([
+        hv.VSpans(g, kdims=["begin", "end"], vdims=vdims, label=d).opts(
+            color=DECISION_STYLE[d][0], fill_alpha=DECISION_STYLE[d][1], line_alpha=0.6,
+            line_width=1, tools=[hover])
+        for d, g in spans.groupby("decision", sort=False)])
 
 
 def mask_gaps(da, tdim, factor=3.0):
@@ -344,10 +594,11 @@ def _clamp(rng, lo, hi, to_dt=False):
     return (a, b) if a < b else (lo, hi)
 
 
-def heatmap(da, tdim, style, cmap, clim, range_xy):
+def heatmap(da, tdim, style, cmap, clim, range_xy, **extra):
     """Rasterized pressure-time heatmap. `cmap`/`clim` may be widget params or
     bound functions; they restyle the live plot without resetting zoom.
-    `range_xy` is the RangeXY stream tracking the visible window."""
+    `range_xy` is the RangeXY stream tracking the visible window; `extra`
+    overrides plot options (comparison panels link axes, add titles)."""
     label = style["label"]
     hover = HoverTool(
         tooltips=[("time", "$x{%F %H:%M}"), ("pressure", "$y{0} dbar"), (label, "@image")],
@@ -358,6 +609,7 @@ def heatmap(da, tdim, style, cmap, clim, range_xy):
         xlabel="Time", ylabel="Pressure (dbar)", tools=[hover],
         shared_axes=False, responsive=True, min_height=350, **DATETIME_OPTS,
     )
+    opts.update(extra)
     qm = hv.QuadMesh(da, kdims=[tdim, "sea_water_pressure"])
     t = da[tdim].values
     p = da["sea_water_pressure"].values
@@ -388,6 +640,38 @@ def scatter_1d(da, tdim, style):
         x=tdim, xlabel="Time", ylabel=label, size=1, grid=True,
         min_height=300, responsive=True,
     ).opts(tools=[hover], shared_axes=False, **DATETIME_OPTS)
+
+
+def compare_1d(a, cmp, tdim, style, overlays=()):
+    """Curated series A over comparison B (gray), points only one of them has
+    colored by category, and an A − B panel below when the grids overlap.
+    `overlays` (spans, markers) go on every panel."""
+    label = style["label"]
+
+    def points(da, name, color, size):
+        da = da.dropna(tdim)
+        hover = HoverTool(
+            tooltips=[("series", name), ("time", f"@{tdim}{{%F %H:%M}}"), (label, f"@{{{da.name}}}")],
+            formatters={f"@{tdim}": "datetime"},
+        )
+        return hv.Scatter((da[tdim].values, da.values), tdim, da.name, label=name).opts(
+            color=color, size=size, tools=[hover])
+
+    main = points(cmp["b"], cmp["label_b"], "#bdbdbd", 3) * points(a, cmp["label_a"], POINT_COLOR, 2)
+    for name, color, d in cmp["removed"] + cmp["added"]:
+        if d.notnull().any():  # empty categories would still add legend entries
+            main = main * points(d, name, color, 5)
+    panels = [(main, dict(ylabel=label, legend_position="top_left", min_height=300))]
+    if cmp["diff"] is not None:
+        diff = points(cmp["diff"], f"{cmp['label_a']} − {cmp['label_b']}", "#009E73", 2) \
+            * hv.HLine(0).opts(color="gray", line_width=1)
+        panels.append((diff, dict(ylabel=f"Δ {label}", min_height=150)))
+    out = []
+    for p, opts in panels:  # overlays first: an Overlay's options don't survive another *
+        for o in overlays:
+            p = p * o
+        out.append(p.opts(xlabel="Time", show_grid=True, responsive=True, **opts, **DATETIME_OPTS))
+    return out
 
 
 def _to_timestamp(v):
@@ -614,7 +898,9 @@ class PanelBase:
 
 
 class CuratedPanel(PanelBase):
-    """Tab 1: one curated product + variable + colormap."""
+    """Tab 1: one curated product + variable + colormap. Compare against the
+    same product at a lower QC level, another build, or another product, and
+    overlay the curation decisions (HITL ledger, adjustments) behind it."""
 
     def __init__(self, on_remove):
         super().__init__(on_remove)
@@ -623,8 +909,11 @@ class CuratedPanel(PanelBase):
             name="Dataset", groups={"": {"-- Select --": "-- Select --"}, **curated_groups(datasets)}, width=480)
         self.var_select = pn.widgets.Select(name="Variable", options=[], width=260)
         self.cmap_select = pn.widgets.Select(name="Colormap", options=CMAP_OPTIONS, width=130)
-        self.mask_toggle = pn.widgets.Checkbox(name="Mask gaps", value=True)
-        self.deploy_toggle = pn.widgets.Checkbox(name="Deployments", value=False)
+        self.compare_select = pn.widgets.Select(name="Compare", groups={"": {"None": ""}}, width=480)
+        self.mask_toggle = pn.widgets.Checkbox(name="Mask gaps", value=True, align="end")
+        self.deploy_toggle = pn.widgets.Checkbox(name="Deployments", value=False, align="end")
+        self.anno_toggle = pn.widgets.Checkbox(name="Annotations", value=False, align="end")
+        self.note_pane = pn.pane.Alert("", alert_type="warning", visible=False)
         # heatmap color range: drag the slider or type either end (values past
         # the slider bounds are allowed). Colormap and range restyle in place.
         self.clim_slider = pn.widgets.EditableRangeSlider(
@@ -639,21 +928,27 @@ class CuratedPanel(PanelBase):
         self._clims, self._clim_key, self._view = {}, None, None
         self.dataset_select.param.watch(self._dataset_changed, "value")
         self.var_select.param.watch(self._var_changed, "value")
-        for w in (self.mask_toggle, self.deploy_toggle):
+        for w in (self.compare_select, self.mask_toggle, self.deploy_toggle, self.anno_toggle):
             w.param.watch(lambda e: self._replot(), "value")
         self.layout = self.build_layout(
-            self.dataset_select, self.var_select, self.cmap_select,
-            self.mask_toggle, self.deploy_toggle)
-        self.layout.insert(1, self.clim_row)
+            self.dataset_select, self.var_select, self.cmap_select)
+        self.layout.insert(1, pn.Row(self.compare_select, self.mask_toggle,
+                                     self.deploy_toggle, self.anno_toggle))
+        self.layout.insert(2, self.clim_row)
+        self.layout.insert(3, self.note_pane)
 
     def _replot(self):
         self.run(self._build, apply=self._show)
 
     def _dataset_changed(self, event):
         datasets = discover_curated()
+        self.compare_select.param.update(
+            groups=compare_groups(event.new, datasets) if event.new in datasets else {"": {"None": ""}},
+            value="")
         if event.new not in datasets:
             self.var_select.options = []
             self.clim_row.visible = False
+            self.note_pane.visible = False
             self.clear()
             return
         self.run(lambda: list(get_dataset(datasets[event.new]).data_vars),
@@ -679,34 +974,97 @@ class CuratedPanel(PanelBase):
 
     def _build(self):
         datasets = discover_curated()
-        name = self.dataset_select.value
-        if name not in datasets or not self.var_select.value:
-            return None
+        name, other = self.dataset_select.value, self.compare_select.value
         var = self.var_select.value
+        if name not in datasets or var not in get_dataset(datasets[name]):
+            return None  # also skips the transient replot while a new dataset loads
         da = load_var(datasets[name], var)
         style = var_style(var)
         tdim = time_dim(da)
-        clims = None
+        clims, cmp, notes = None, None, []
+        if other in datasets:
+            if var not in get_dataset(datasets[other]):
+                notes.append(f"{var} isn't in {other}")
+            elif get_dataset(datasets[other])[var].ndim != da.ndim:
+                notes.append("can't compare a profile product with a time series")
+            else:
+                cmp = compare_arrays(name, other, var, datasets)
+        overlays = self._overlays(name, da, notes)
         if da.ndim == 2:
             q = [float(v) for v in da.quantile([0.001, 0.02, 0.98, 0.999]).values]
             clims = dict(standard=style["clim"], auto=(q[1], q[2]), bounds=(q[0], q[3]))
-            if self.mask_toggle.value:
-                da = mask_gaps(da, tdim)
-            cmap = pn.bind(lambda n: cmocean.cm.cmap_d[n], self.cmap_select)
-            rng = hv.streams.RangeXY()
-            plot = heatmap(da, tdim, style, cmap, self.clim_slider.param.value, rng)
-            clims["view"] = (da, tdim, rng)
+            panels = self._heatmaps(da, tdim, style, cmp, clims, notes)
+        elif cmp:
+            panels = compare_1d(da, cmp, tdim, style, overlays)
+            overlays = []
         else:
-            plot = scatter_1d(da, tdim, style)
-        refdes = curated_refdes(name)
-        if self.deploy_toggle.value and refdes:
-            plot = plot * deployment_overlay(refdes)
-        return plot, clims
+            panels = [scatter_1d(da, tdim, style)]
+        for o in overlays:
+            panels = [p * o for p in panels]
+        plot = panels[0] if len(panels) == 1 else hv.Layout(panels).cols(1)
+        return plot, clims, notes
+
+    def _overlays(self, name, da, notes):
+        """Deployment markers and curation spans, as toggled; failures become notes."""
+        overlays = []
+        if self.deploy_toggle.value:
+            try:
+                refdes = curated_refdes(name)
+                if refdes:
+                    overlays.append(deployment_overlay(refdes))
+            except Exception as e:
+                notes.append(f"deployments unavailable: {e}")
+        if self.anno_toggle.value:
+            try:
+                overlays.append(curation_overlay(name, da))
+                # releases carry their own decisions; older builds are drawn from main
+                built = get_dataset(discover_curated()[name]).attrs.get("hitl_ledger_sha1")
+                if not release_of(name) and built and built != ledger_sha():
+                    notes.append(f"the ledger has changed since this build ({built}); spans show current decisions")
+            except Exception as e:
+                notes.append(f"annotations unavailable: {e}")
+        return overlays
+
+    def _heatmaps(self, da, tdim, style, cmp, clims, notes):
+        """The heatmap, plus the comparison product and, for another build or
+        level of the same product, a changes panel: red where only B has data,
+        green where only A has. Panels of one product share zoom; another
+        product keeps its own axes."""
+        cmap = pn.bind(lambda n: cmocean.cm.cmap_d[n], self.cmap_select)
+        clim = self.clim_slider.param.value
+        gaps = (lambda x, t: mask_gaps(x, t)) if self.mask_toggle.value else (lambda x, t: x)
+        rng = hv.streams.RangeXY()
+        clims["view"] = (gaps(da, tdim), tdim, rng)
+        if cmp is None:
+            return [heatmap(gaps(da, tdim), tdim, style, cmap, clim, rng)]
+        b, tb = cmp["b"], time_dim(cmp["b"])
+        extra = dict(shared_axes=cmp["same_product"], min_height=260)
+        panels = [heatmap(gaps(da, tdim), tdim, style, cmap, clim, rng, title=cmp["label_a"], **extra),
+                  heatmap(gaps(b, tb), tb, style, cmap, clim, hv.streams.RangeXY(),
+                          title=cmp["label_b"], **extra)]
+        if cmp["same_product"]:
+            # 1 = only B has data, 2 = only A has; the sets are disjoint
+            masks = xr.align(*[d.notnull() for _, _, d in cmp["removed"] + cmp["added"]],
+                             join="outer", fill_value=False)
+            only_b = sum(masks[:len(cmp["removed"])]) > 0
+            only_a = sum(masks[len(cmp["removed"]):]) > 0 if cmp["added"] else xr.zeros_like(only_b)
+            if not (only_b.any() or only_a.any()):
+                notes.append(f"no cells differ in coverage between {cmp['label_a']} and {cmp['label_b']}")
+                return panels
+            change = xr.where(only_b, 1.0, xr.where(only_a, 2.0, np.nan)).rename("change")
+            panels.append(heatmap(
+                gaps(change, tdim), tdim, dict(label="change (1 = only B, 2 = only A)"),
+                ["#d62728", "#009E73"], (1, 2), hv.streams.RangeXY(), colorbar=False,
+                title=f"red: only in {cmp['label_b']} · green: only in {cmp['label_a']}", **extra))
+        return panels
 
     def _show(self, result):
         if result is None:
+            self.note_pane.visible = False
             return
-        plot, clims = result
+        plot, clims, notes = result
+        self.note_pane.object = "⚠ " + "; ".join(notes) if notes else ""
+        self.note_pane.visible = bool(notes)
         is_2d = clims is not None
         self.cmap_select.disabled = not is_2d
         self.mask_toggle.disabled = not is_2d
@@ -950,7 +1308,7 @@ class TimeMachinePanel(PanelBase):
 
     def __init__(self):
         super().__init__()
-        fixed = [k for k in discover_curated() if "_profiles_" not in k]
+        fixed = [k for k in discover_curated() if "_profiles" not in product_key(k)[1]]
         self.sources = {k: ("curated", discover_curated()[k]) for k in fixed}
         self.sources.update({r: ("stream", r) for r in SITES_DICT})
         self.dataset_select = pn.widgets.Select(
