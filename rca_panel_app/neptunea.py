@@ -4,6 +4,8 @@ Five tabs:
   1. Curated Products — verify CRESST curated zarr products (profiler heatmaps,
      fixed-mooring time series) with lock-on hover and full-res zoom.
      Heatmap color range is adjustable live (drag/type, standard, fit to view).
+     Hover a heatmap column for its depth profile; click to pin it and overlay
+     the cast's raw samples.
      Products come from CRESST release manifests (catalog.json) where a
      folder has them. Compare with a lower QC level, another release/build,
      or another product, and overlay the curation decisions (HITL ledger,
@@ -631,36 +633,101 @@ def heatmap(da, tdim, style, cmap, clim, range_xy, **extra):
 
 
 PROFILE_TS = ["sea_water_temperature", "sea_water_practical_salinity"]
+DOWNCAST = {"ph", "pco2"}  # sites.csv instruments sampled on the descent after the CTD upcast
 
 
-def profile_inspector(source, da, tdim, range_xy, ts=()):
+def raw_sources(key, var):
+    """Raw ooi-data streams behind a profile product: (refdes carrying `var`,
+    CTD refdes, whether `var` is sampled on the downcast); refdes None if absent."""
+    rows = list(product_instruments(key).itertuples())
+    has = lambda r, v: r.refdes in SITES_DICT and v in SITES_DICT[r.refdes]["params"]
+    src = next((r for r in rows if has(r, var)), None)
+    ctd = next((r.refdes for r in rows if r.instrument == "ctd" and has(r, PROFILE_TS[0])), None)
+    return src and src.refdes, ctd, bool(src) and src.instrument in DOWNCAST
+
+
+@pn.cache(max_items=32, policy="LRU")
+def raw_cast(refdes, t0, t1, variables):
+    """Raw `variables` and pressure from one cast window of a stream."""
+    ds = get_dataset(_stream_path(refdes))
+    pv = next(v for v in ("sea_water_pressure", "int_ctd_pressure") if v in ds)
+    return ds[[pv, *variables]].sel(time=slice(t0, t1)).load().rename({pv: "raw_pressure"})
+
+
+def profile_inspector(source, da, tdim, range_xy, ts=(), raw=None, run=None):
     """Pressure-vs-value curves of the heatmap column nearest the pointer over
     `source` that has data (pH/pCO2 profiles are only 1–2 casts a day), on the
     heatmap's pressure zoom; narrow T/S panels (`ts`) from the same column share
     the pressure axis. Profile products draw T/S from the upcast and pH/pCO2
-    from the following downcast, so T/S are labeled upcast."""
+    from the following downcast, so T/S are labeled upcast.
+    A click pins the column; with `raw` (raw_sources) the pinned cast's raw
+    samples are drawn over the gridded curves: the variable's instrument on its
+    cast (downcast: peak→end, else start→peak) and CTD T/S over the same window.
+    Raw casts are read off the event loop via `run` (PanelBase.run): the first
+    read of a stream loads its full time index (1 Hz CTD: tens of seconds).
+    Returns the layout and the Tap stream (event(x=None) unpins)."""
     pointer = hv.streams.PointerX(source=source)
+    tap = hv.streams.Tap(source=source, rename={"x": "tap_x", "y": "tap_y"})
     p = da["sea_water_pressure"]
     full = (float(p.min()), float(p.max()))
     suffix = " (upcast)" if tdim == "peak_time" else ""
     have = da[tdim].where(da.notnull().any("sea_water_pressure"), drop=True)
+    src, ctd, down = raw or (None, None, False)
+    # raw refs: (refdes, variables read together), so T and S share one CTD read
+    main_ref, ts_ref = src and (src, (da.name,)), ctd and (ctd, tuple(v.name for v in ts))
+    loaded, arrived = {}, hv.streams.Counter()  # raw casts by raw_cast args; ticks on arrival
 
-    def curve(arr, label, width, title):
-        def view(x=None, x_range=None, y_range=None):
-            t = have.sel({tdim: _to_timestamp(x)}, method="nearest") if x is not None else have[-1]
-            col = arr.sel({tdim: t.values})
+    def column(at):
+        return have.sel({tdim: _to_timestamp(at)}, method="nearest") if at is not None else have[-1]
+
+    def cast_args(t, ref):
+        c = da.sel({tdim: t.values})
+        t0, t1 = (c[tdim], c.end_time) if down else (c.start_time, c[tdim])
+        return ref[0], pd.Timestamp(t0.values), pd.Timestamp(t1.values), ref[1]
+
+    def fetch(tap_x=None, tap_y=None):
+        args = [cast_args(column(tap_x), r) for r in (main_ref, ts_ref) if r] if tap_x is not None else []
+        if all(a in loaded for a in args):
+            return
+        def done(casts):
+            loaded.update(zip(args, casts))
+            arrived.event()
+        run(lambda: [raw_cast(*a) for a in args], apply=done)
+
+    tap.add_subscriber(fetch)
+
+    def curve(arr, label, width, title, raw_ref):
+        def view(x=None, tap_x=None, tap_y=None, x_range=None, y_range=None, counter=0):
+            pinned = tap_x is not None
+            col = arr.sel({tdim: column(tap_x if pinned else x).values})
             when = pd.Timestamp(col[tdim].values)
-            head = f"{when:%Y-%m-%d %H:%M}" + (f" · profile {int(col.profile_number)}"
-                                               if "profile_number" in col.coords else "")
-            return hv.Curve((col.values, p.values), kdims=[label], vdims=["Pressure (dbar)"]).opts(
+            head = ("pinned " if pinned else "") + f"{when:%Y-%m-%d %H:%M}" + (
+                f" · profile {int(col.profile_number)}" if "profile_number" in col.coords else "")
+            xlabel, raw_xy = label, ([], [])
+            cast = loaded.get(cast_args(col[tdim], raw_ref)) if pinned and raw_ref else None
+            if pinned and raw_ref and cast is None:
+                xlabel = f"{label} · loading raw…"
+            elif cast is not None:
+                pts = cast.dropna("time", subset=[arr.name])
+                raw_xy = (pts[arr.name].values, pts.raw_pressure.values)
+                if title:  # sample spacing: do gradients fall between profiler stops?
+                    gap = pts.raw_pressure.sortby(pts.raw_pressure).diff("time").max().item() if pts.time.size > 1 else 0
+                    xlabel = f"{label} · {pts.time.size} raw, max gap {gap:.0f} dbar"
+                elif down:
+                    xlabel = f"{label} · dots: downcast"
+            el = (hv.Curve((col.values, p.values), kdims=[label], vdims=["Pressure (dbar)"])
+                  * hv.Scatter(raw_xy, kdims=[label], vdims=["Pressure (dbar)"]).opts(
+                      color="#ff7f0e", size=6 if title else 2, tools=["hover"]))
+            return el.opts(
                 title=head if title else "", width=width, height=350, invert_yaxis=True,
-                ylim=tuple(sorted(y_range)) if y_range else full, color="#08306b",
-                tools=["hover"], default_tools=["save", "reset"], active_tools=[], framewise=True)
-        return hv.DynamicMap(view, streams=[pointer, range_xy])
+                ylim=tuple(sorted(y_range)) if y_range else full, xlabel=xlabel,
+                default_tools=["save", "reset"], active_tools=[], framewise=True).opts(
+                hv.opts.Curve(color="#08306b", tools=["hover"]))
+        return hv.DynamicMap(view, streams=[pointer, tap, range_xy, arrived])
 
-    curves = [curve(da, var_style(da.name)["label"], 300, True)]
-    curves += [curve(t, var_style(t.name)["label"] + suffix, 170, False) for t in ts]
-    return hv.Layout(curves).cols(len(curves))
+    curves = [curve(da, var_style(da.name)["label"], 300, True, main_ref)]
+    curves += [curve(t, var_style(t.name)["label"] + suffix, 170, False, ts_ref) for t in ts]
+    return hv.Layout(curves).cols(len(curves)), tap
 
 
 def scatter_1d(da, tdim, style):
@@ -948,7 +1015,10 @@ class CuratedPanel(PanelBase):
         self.anno_toggle = pn.widgets.Checkbox(name="Annotations", value=False, align="end")
         self.profile_toggle = pn.widgets.Checkbox(name="Profile", value=True, align="end")
         self.note_pane = pn.pane.Alert("", alert_type="warning", visible=False)
-        self.profile_pane = pn.pane.HoloViews(None, visible=False)  # hovered heatmap column
+        self.profile_pane = pn.pane.HoloViews(None, visible=False)  # hovered/clicked heatmap column
+        self.unpin_btn = pn.widgets.Button(name="Follow hover", width=110, visible=False)
+        self.unpin_btn.on_click(lambda e: self._tap.event(x=None))
+        self._tap = None  # click stream pinning the profile
         # heatmap color range: drag the slider or type either end (values past
         # the slider bounds are allowed). Colormap and range restyle in place.
         self.clim_slider = pn.widgets.EditableRangeSlider(
@@ -972,11 +1042,13 @@ class CuratedPanel(PanelBase):
                                      self.deploy_toggle, self.anno_toggle, self.profile_toggle))
         self.layout.insert(2, self.clim_row)
         self.layout.insert(3, self.note_pane)
-        self.layout[-1] = pn.Row(self.plot_pane, self.profile_pane, sizing_mode="stretch_width")
+        self.layout[-1] = pn.Row(self.plot_pane, pn.Column(self.profile_pane, self.unpin_btn),
+                                 sizing_mode="stretch_width")
 
     def clear(self):
         super().clear()
         self.profile_pane.param.update(object=None, visible=False)
+        self.unpin_btn.visible = False
 
     def _replot(self):
         self.run(self._build, apply=self._show)
@@ -1038,7 +1110,8 @@ class CuratedPanel(PanelBase):
             if self.profile_toggle.value:
                 ts = [] if var in PROFILE_TS else [
                     load_var(datasets[name], v) for v in PROFILE_TS if v in get_dataset(datasets[name])]
-                side = profile_inspector(panels[0], da, tdim, clims["view"][2], ts)
+                raw = raw_sources(name, var) if tdim == "peak_time" else None  # single casts only
+                side = profile_inspector(panels[0], da, tdim, clims["view"][2], ts, raw, self.run)
         elif cmp:
             panels = compare_1d(da, cmp, tdim, style, overlays)
             overlays = []
@@ -1110,7 +1183,9 @@ class CuratedPanel(PanelBase):
         plot, clims, notes, side = result
         self.note_pane.object = "⚠ " + "; ".join(notes) if notes else ""
         self.note_pane.visible = bool(notes)
+        side, self._tap = side or (None, None)
         self.profile_pane.param.update(object=side, visible=side is not None)
+        self.unpin_btn.visible = side is not None
         is_2d = clims is not None
         self.cmap_select.disabled = not is_2d
         self.mask_toggle.disabled = not is_2d

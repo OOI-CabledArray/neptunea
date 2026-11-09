@@ -19,7 +19,11 @@ see [deploy/README.md](deploy/README.md).
   - **Profile** — hover a heatmap column for its pressure-vs-value curve,
     following the heatmap's pressure zoom: the nearest profile (or 24 h bin)
     with data for the variable, plus T and S from the same column (the upcast
-    in profile products; pH/pCO2 come from the following downcast).
+    in profile products; pH/pCO2 come from the following downcast). Click to
+    pin a profile and overlay that cast's raw samples from `ooi-data`: the
+    variable's instrument (pH/pCO2 on the downcast, with sample count and
+    largest pressure gap) and raw CTD T/S over the same window. "Follow hover"
+    unpins.
   - **Compare** against the same product at a lower QC level (`ooi` → `qartod`
     → `hitl` → `advanced`), another release/build, or another product in the
     same release. Time series: the comparison in gray, points only one side has
@@ -71,7 +75,7 @@ what `uv.lock` pins.
 ## Roadmap
 
 1. POST drafted annotations to M2M behind a confirmation step
-2. Profile inspector: click a profile → raw pH/pCO2 samples for that cast and raw CTD T/S from the same descent over the gridded curve (shows whether gradients fall between profiler stops; informs the sparse-sensor interpolation rule)
+2. Faster raw casts in the profile inspector: find the cast by bisecting the stream's time chunks instead of loading its full time index (first click per site reads ~675 MB of CTD time and holds ~2.5 GB RAM)
 3. Annotation table row → plot span linking
 4. `localRanges.yaml` as a third y-range option
 5. Persist stream overview caches to disk
