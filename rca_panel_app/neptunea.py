@@ -632,7 +632,7 @@ def heatmap(da, tdim, style, cmap, clim, range_xy, **extra):
     return dmap.apply.opts(cmap=cmap, clim=clim)
 
 
-PROFILE_TS = ["sea_water_temperature", "sea_water_practical_salinity"]
+PROFILE_TS = {"sea_water_temperature": "T (°C)", "sea_water_practical_salinity": "S (psu)"}  # narrow-panel labels
 DOWNCAST = {"ph", "pco2"}  # sites.csv instruments sampled on the descent after the CTD upcast
 
 
@@ -642,7 +642,7 @@ def raw_sources(key, var):
     rows = list(product_instruments(key).itertuples())
     has = lambda r, v: r.refdes in SITES_DICT and v in SITES_DICT[r.refdes]["params"]
     src = next((r for r in rows if has(r, var)), None)
-    ctd = next((r.refdes for r in rows if r.instrument == "ctd" and has(r, PROFILE_TS[0])), None)
+    ctd = next((r.refdes for r in rows if r.instrument == "ctd" and has(r, "sea_water_temperature")), None)
     return src and src.refdes, ctd, bool(src) and src.instrument in DOWNCAST
 
 
@@ -665,7 +665,9 @@ def profile_inspector(source, da, tdim, range_xy, ts=(), raw=None, run=None):
     cast (downcast: peak→end, else start→peak) and CTD T/S over the same window.
     Raw casts are read off the event loop via `run` (PanelBase.run): the first
     read of a stream loads its full time index (1 Hz CTD: tens of seconds).
-    Returns the layout and the Tap stream (event(x=None) unpins)."""
+    Returns the panels (shown as separate panes: an hv.Layout renders with
+    collapsed axes inside the FastListTemplate) and the Tap stream
+    (event(x=None) unpins)."""
     pointer = hv.streams.PointerX(source=source)
     tap = hv.streams.Tap(source=source, rename={"x": "tap_x", "y": "tap_y"})
     p = da["sea_water_pressure"]
@@ -696,38 +698,55 @@ def profile_inspector(source, da, tdim, range_xy, ts=(), raw=None, run=None):
 
     tap.add_subscriber(fetch)
 
-    def curve(arr, label, width, title, raw_ref):
+    def curve(arr, label, width, main, raw_ref):
         def view(x=None, tap_x=None, tap_y=None, x_range=None, y_range=None, counter=0):
             pinned = tap_x is not None
             col = arr.sel({tdim: column(tap_x if pinned else x).values})
             when = pd.Timestamp(col[tdim].values)
-            head = ("pinned " if pinned else "") + f"{when:%Y-%m-%d %H:%M}" + (
-                f" · profile {int(col.profile_number)}" if "profile_number" in col.coords else "")
-            xlabel, raw_xy = label, ([], [])
+            status, raw_pv = "", ([], [])  # raw-sample state
             cast = loaded.get(cast_args(col[tdim], raw_ref)) if pinned and raw_ref else None
             if pinned and raw_ref and cast is None:
-                xlabel = f"{label} · loading raw…"
+                status = "loading raw…"
             elif cast is not None:
                 pts = cast.dropna("time", subset=[arr.name])
-                raw_xy = (pts[arr.name].values, pts.raw_pressure.values)
-                if title:  # sample spacing: do gradients fall between profiler stops?
+                raw_pv = (pts.raw_pressure.values, pts[arr.name].values)
+                if main:  # sample spacing: do gradients fall between profiler stops?
                     gap = pts.raw_pressure.sortby(pts.raw_pressure).diff("time").max().item() if pts.time.size > 1 else 0
-                    xlabel = f"{label} · {pts.time.size} raw, max gap {gap:.0f} dbar"
+                    status = f"{pts.time.size} raw, max gap {gap:.0f} dbar"
                 elif down:
-                    xlabel = f"{label} · dots: downcast"
-            el = (hv.Curve((col.values, p.values), kdims=[label], vdims=["Pressure (dbar)"])
-                  * hv.Scatter(raw_xy, kdims=[label], vdims=["Pressure (dbar)"]).opts(
-                      color="#ff7f0e", size=6 if title else 2, tools=["hover"]))
+                    status = "dots: downcast"
+            if main:
+                title = ("📌 " if pinned else "") + f"{when:%Y-%m-%d %H:%M}" + (
+                    f" · #{int(col.profile_number)}" if "profile_number" in col.coords else "")
+                xlabel = " · ".join(filter(None, [label, status]))
+            else:  # narrow T/S panels: cast note as the title
+                title, xlabel = status or suffix.strip(" ()") or " ", label
+            # pressure is the key dimension, drawn vertically (invert_axes), so
+            # the curve connects levels in depth order. Both ranges are set per
+            # frame: a first frame without data otherwise pins the axis to 0–1.
+            vals = np.concatenate([col.values, raw_pv[1]])
+            vals = vals[np.isfinite(vals)]
+            lo, hi = (vals.min(), vals.max()) if vals.size else (0.0, 1.0)
+            pad = (hi - lo) * 0.05 or 0.01
+            pdim = hv.Dimension("pressure", label="Pressure (dbar)",
+                                range=tuple(sorted(y_range)) if y_range else full)
+            vdim = hv.Dimension(arr.name, label=xlabel, range=(lo - pad, hi + pad))
+            el = (hv.Curve((p.values, col.values), pdim, vdim)
+                  * hv.Scatter(raw_pv, pdim, vdim).opts(
+                      color="#ff7f0e", size=6 if main else 2, tools=["hover"]))
+            # fixed frame sizes and a title on every panel keep the frames aligned
             return el.opts(
-                title=head if title else "", width=width, height=350, invert_yaxis=True,
-                ylim=tuple(sorted(y_range)) if y_range else full, xlabel=xlabel,
-                default_tools=["save", "reset"], active_tools=[], framewise=True).opts(
-                hv.opts.Curve(color="#08306b", tools=["hover"]))
+                title=title, frame_width=width, frame_height=290, invert_axes=True,
+                invert_yaxis=True, xticks=3, yrotation=90, yaxis="left" if main else "bare",
+                fontsize={"title": "9pt", "labels": "9pt", "ticks": "8pt"},
+                toolbar=None, default_tools=[], active_tools=[], framewise=True).opts(
+                hv.opts.Curve(color="#08306b", tools=["hover"], framewise=True),
+                hv.opts.Scatter(framewise=True))  # per element, or ranges stay at the first frame's
         return hv.DynamicMap(view, streams=[pointer, tap, range_xy, arrived])
 
-    curves = [curve(da, var_style(da.name)["label"], 300, True, main_ref)]
-    curves += [curve(t, var_style(t.name)["label"] + suffix, 170, False, ts_ref) for t in ts]
-    return hv.Layout(curves).cols(len(curves)), tap
+    curves = [curve(da, var_style(da.name)["label"], 170, True, main_ref)]
+    curves += [curve(t, PROFILE_TS[t.name], 90, False, ts_ref) for t in ts]
+    return curves, tap
 
 
 def scatter_1d(da, tdim, style):
@@ -1015,8 +1034,11 @@ class CuratedPanel(PanelBase):
         self.anno_toggle = pn.widgets.Checkbox(name="Annotations", value=False, align="end")
         self.profile_toggle = pn.widgets.Checkbox(name="Profile", value=True, align="end")
         self.note_pane = pn.pane.Alert("", alert_type="warning", visible=False)
-        self.profile_pane = pn.pane.HoloViews(None, visible=False)  # hovered/clicked heatmap column
-        self.unpin_btn = pn.widgets.Button(name="Follow hover", width=110, visible=False)
+        # hovered/clicked heatmap column: a new HoloViews pane per plot, swapped
+        # into this box. A pane created empty sizes later plots to zero height,
+        # and toggling its `visible` raises a stylesheets TypeError (Panel 1.9).
+        self.profile_box = pn.Column()
+        self.unpin_btn = pn.widgets.Button(name="Follow hover", width=110)
         self.unpin_btn.on_click(lambda e: self._tap.event(x=None))
         self._tap = None  # click stream pinning the profile
         # heatmap color range: drag the slider or type either end (values past
@@ -1042,13 +1064,11 @@ class CuratedPanel(PanelBase):
                                      self.deploy_toggle, self.anno_toggle, self.profile_toggle))
         self.layout.insert(2, self.clim_row)
         self.layout.insert(3, self.note_pane)
-        self.layout[-1] = pn.Row(self.plot_pane, pn.Column(self.profile_pane, self.unpin_btn),
-                                 sizing_mode="stretch_width")
+        self.layout[-1] = pn.Row(self.plot_pane, self.profile_box, sizing_mode="stretch_width")
 
     def clear(self):
         super().clear()
-        self.profile_pane.param.update(object=None, visible=False)
-        self.unpin_btn.visible = False
+        self.profile_box.objects = []
 
     def _replot(self):
         self.run(self._build, apply=self._show)
@@ -1184,8 +1204,8 @@ class CuratedPanel(PanelBase):
         self.note_pane.object = "⚠ " + "; ".join(notes) if notes else ""
         self.note_pane.visible = bool(notes)
         side, self._tap = side or (None, None)
-        self.profile_pane.param.update(object=side, visible=side is not None)
-        self.unpin_btn.visible = side is not None
+        self.profile_box.objects = [] if side is None else [
+            pn.Row(*[pn.pane.HoloViews(c) for c in side]), self.unpin_btn]
         is_2d = clims is not None
         self.cmap_select.disabled = not is_2d
         self.mask_toggle.disabled = not is_2d
