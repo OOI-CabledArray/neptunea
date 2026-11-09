@@ -16,6 +16,10 @@ see [deploy/README.md](deploy/README.md).
   heatmaps (profilers) or time series (fixed moorings). Colormap, gap masking,
   deployment markers, side-by-side panels. Heatmap color range: drag/type,
   params standard, or fit to the zoomed view.
+  - **Profile** — hover a heatmap column for its pressure-vs-value curve,
+    following the heatmap's pressure zoom: the nearest profile (or 24 h bin)
+    with data for the variable, plus T and S from the same column (the upcast
+    in profile products; pH/pCO2 come from the following downcast).
   - **Compare** against the same product at a lower QC level (`ooi` → `qartod`
     → `hitl` → `advanced`), another release/build, or another product in the
     same release. Time series: the comparison in gray, points only one side has
@@ -67,7 +71,7 @@ what `uv.lock` pins.
 ## Roadmap
 
 1. POST drafted annotations to M2M behind a confirmation step
-2. Click a heatmap profile → depth-curve inspector
+2. Profile inspector: click a profile → raw pH/pCO2 samples for that cast and raw CTD T/S from the same descent over the gridded curve (shows whether gradients fall between profiler stops; informs the sparse-sensor interpolation rule)
 3. Annotation table row → plot span linking
 4. `localRanges.yaml` as a third y-range option
 5. Persist stream overview caches to disk
