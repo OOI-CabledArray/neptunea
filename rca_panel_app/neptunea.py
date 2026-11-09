@@ -630,6 +630,39 @@ def heatmap(da, tdim, style, cmap, clim, range_xy, **extra):
     return dmap.apply.opts(cmap=cmap, clim=clim)
 
 
+PROFILE_TS = ["sea_water_temperature", "sea_water_practical_salinity"]
+
+
+def profile_inspector(source, da, tdim, range_xy, ts=()):
+    """Pressure-vs-value curves of the heatmap column nearest the pointer over
+    `source` that has data (pH/pCO2 profiles are only 1–2 casts a day), on the
+    heatmap's pressure zoom; narrow T/S panels (`ts`) from the same column share
+    the pressure axis. Profile products draw T/S from the upcast and pH/pCO2
+    from the following downcast, so T/S are labeled upcast."""
+    pointer = hv.streams.PointerX(source=source)
+    p = da["sea_water_pressure"]
+    full = (float(p.min()), float(p.max()))
+    suffix = " (upcast)" if tdim == "peak_time" else ""
+    have = da[tdim].where(da.notnull().any("sea_water_pressure"), drop=True)
+
+    def curve(arr, label, width, title):
+        def view(x=None, x_range=None, y_range=None):
+            t = have.sel({tdim: _to_timestamp(x)}, method="nearest") if x is not None else have[-1]
+            col = arr.sel({tdim: t.values})
+            when = pd.Timestamp(col[tdim].values)
+            head = f"{when:%Y-%m-%d %H:%M}" + (f" · profile {int(col.profile_number)}"
+                                               if "profile_number" in col.coords else "")
+            return hv.Curve((col.values, p.values), kdims=[label], vdims=["Pressure (dbar)"]).opts(
+                title=head if title else "", width=width, height=350, invert_yaxis=True,
+                ylim=tuple(sorted(y_range)) if y_range else full, color="#08306b",
+                tools=["hover"], default_tools=["save", "reset"], active_tools=[], framewise=True)
+        return hv.DynamicMap(view, streams=[pointer, range_xy])
+
+    curves = [curve(da, var_style(da.name)["label"], 300, True)]
+    curves += [curve(t, var_style(t.name)["label"] + suffix, 170, False) for t in ts]
+    return hv.Layout(curves).cols(len(curves))
+
+
 def scatter_1d(da, tdim, style):
     label = style["label"]
     hover = HoverTool(
@@ -913,7 +946,9 @@ class CuratedPanel(PanelBase):
         self.mask_toggle = pn.widgets.Checkbox(name="Mask gaps", value=True, align="end")
         self.deploy_toggle = pn.widgets.Checkbox(name="Deployments", value=False, align="end")
         self.anno_toggle = pn.widgets.Checkbox(name="Annotations", value=False, align="end")
+        self.profile_toggle = pn.widgets.Checkbox(name="Profile", value=True, align="end")
         self.note_pane = pn.pane.Alert("", alert_type="warning", visible=False)
+        self.profile_pane = pn.pane.HoloViews(None, visible=False)  # hovered heatmap column
         # heatmap color range: drag the slider or type either end (values past
         # the slider bounds are allowed). Colormap and range restyle in place.
         self.clim_slider = pn.widgets.EditableRangeSlider(
@@ -928,14 +963,20 @@ class CuratedPanel(PanelBase):
         self._clims, self._clim_key, self._view = {}, None, None
         self.dataset_select.param.watch(self._dataset_changed, "value")
         self.var_select.param.watch(self._var_changed, "value")
-        for w in (self.compare_select, self.mask_toggle, self.deploy_toggle, self.anno_toggle):
+        for w in (self.compare_select, self.mask_toggle, self.deploy_toggle, self.anno_toggle,
+                  self.profile_toggle):
             w.param.watch(lambda e: self._replot(), "value")
         self.layout = self.build_layout(
             self.dataset_select, self.var_select, self.cmap_select)
         self.layout.insert(1, pn.Row(self.compare_select, self.mask_toggle,
-                                     self.deploy_toggle, self.anno_toggle))
+                                     self.deploy_toggle, self.anno_toggle, self.profile_toggle))
         self.layout.insert(2, self.clim_row)
         self.layout.insert(3, self.note_pane)
+        self.layout[-1] = pn.Row(self.plot_pane, self.profile_pane, sizing_mode="stretch_width")
+
+    def clear(self):
+        super().clear()
+        self.profile_pane.param.update(object=None, visible=False)
 
     def _replot(self):
         self.run(self._build, apply=self._show)
@@ -981,7 +1022,7 @@ class CuratedPanel(PanelBase):
         da = load_var(datasets[name], var)
         style = var_style(var)
         tdim = time_dim(da)
-        clims, cmp, notes = None, None, []
+        clims, cmp, notes, side = None, None, [], None
         if other in datasets:
             if var not in get_dataset(datasets[other]):
                 notes.append(f"{var} isn't in {other}")
@@ -994,6 +1035,10 @@ class CuratedPanel(PanelBase):
             q = [float(v) for v in da.quantile([0.001, 0.02, 0.98, 0.999]).values]
             clims = dict(standard=style["clim"], auto=(q[1], q[2]), bounds=(q[0], q[3]))
             panels = self._heatmaps(da, tdim, style, cmp, clims, notes)
+            if self.profile_toggle.value:
+                ts = [] if var in PROFILE_TS else [
+                    load_var(datasets[name], v) for v in PROFILE_TS if v in get_dataset(datasets[name])]
+                side = profile_inspector(panels[0], da, tdim, clims["view"][2], ts)
         elif cmp:
             panels = compare_1d(da, cmp, tdim, style, overlays)
             overlays = []
@@ -1002,7 +1047,7 @@ class CuratedPanel(PanelBase):
         for o in overlays:
             panels = [p * o for p in panels]
         plot = panels[0] if len(panels) == 1 else hv.Layout(panels).cols(1)
-        return plot, clims, notes
+        return plot, clims, notes, side
 
     def _overlays(self, name, da, notes):
         """Deployment markers and curation spans, as toggled; failures become notes."""
@@ -1062,12 +1107,14 @@ class CuratedPanel(PanelBase):
         if result is None:
             self.note_pane.visible = False
             return
-        plot, clims, notes = result
+        plot, clims, notes, side = result
         self.note_pane.object = "⚠ " + "; ".join(notes) if notes else ""
         self.note_pane.visible = bool(notes)
+        self.profile_pane.param.update(object=side, visible=side is not None)
         is_2d = clims is not None
         self.cmap_select.disabled = not is_2d
         self.mask_toggle.disabled = not is_2d
+        self.profile_toggle.disabled = not is_2d
         self.clim_row.visible = is_2d
         if is_2d:
             # slider spans the data (0.1–99.9%) and the standard range; the
