@@ -63,8 +63,9 @@ what `uv.lock` pins.
 
 ## Notes
 
-- Plot standards come from rca-data-tools `params/` (local checkout, else
-  GitHub raw); climatology from `~/repos/qc-lookup` QARTOD tables.
+- Plot standards (ranges, colormaps, profile line colors from `lineColor`)
+  come from rca-data-tools `params/` (local checkout, else GitHub raw);
+  climatology from `~/repos/qc-lookup` QARTOD tables.
 - Caching: curated product list and annotations refresh every 10 min; release
   manifests and files are kept until restart (releases are immutable); curated
   variables load into memory; stream overviews are cached per

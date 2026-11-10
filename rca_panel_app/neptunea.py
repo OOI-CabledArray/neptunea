@@ -132,13 +132,14 @@ SITES_DICT = {
 
 
 def var_style(var):
-    """Standard cmap/clim/ylim/label for an xarray variable name."""
+    """Standard cmap/clim/ylim/label/line color for an xarray variable name."""
     param = VAR_TO_PARAM.get(var)
     if param not in VARIABLE_PARAMS.index:
-        return dict(cmap="thermal", clim=None, ylim=None, label=var)
+        return dict(cmap="thermal", clim=None, ylim=None, label=var, color=POINT_COLOR)
     r = VARIABLE_PARAMS.loc[param]
     return dict(
         cmap=r.colorMap,
+        color=r.lineColor if pd.notna(r.get("lineColor")) else POINT_COLOR,  # profile lines
         clim=(float(r.profileMin), float(r.profileMax)),
         ylim=(float(r["min"]), float(r["max"])),
         label=f"{param} ({r.label})" if pd.notna(r.label) else param,
@@ -731,16 +732,19 @@ def profile_inspector(source, da, tdim, range_xy, ts=(), raw=None, run=None):
             pdim = hv.Dimension("pressure", label="Pressure (dbar)",
                                 range=tuple(sorted(y_range)) if y_range else full)
             vdim = hv.Dimension(arr.name, label=xlabel, range=(lo - pad, hi + pad))
-            el = (hv.Curve((p.values, col.values), pdim, vdim)
-                  * hv.Scatter(raw_pv, pdim, vdim).opts(
-                      color="#ff7f0e", size=6 if main else 2, tools=["hover"]))
+            # line in the params lineColor over neutral raw samples: profiler stops
+            # (pH/pCO2, ~12 a cast) as open circles, dense 1 Hz CTD data as faint dots
+            raw_style = (dict(color="#333333", alpha=0.25, size=2) if len(raw_pv[0]) > 200
+                         else dict(fill_color="white", line_color="black", size=7 if main else 4))
+            el = (hv.Scatter(raw_pv, pdim, vdim).opts(tools=["hover"], **raw_style)
+                  * hv.Curve((p.values, col.values), pdim, vdim).opts(color=var_style(arr.name)["color"]))
             # fixed frame sizes and a title on every panel keep the frames aligned
             return el.opts(
                 title=title, frame_width=width, frame_height=290, invert_axes=True,
                 invert_yaxis=True, xticks=3, yrotation=90, yaxis="left" if main else "bare",
                 fontsize={"title": "9pt", "labels": "9pt", "ticks": "8pt"},
                 toolbar=None, default_tools=[], active_tools=[], framewise=True).opts(
-                hv.opts.Curve(color="#08306b", tools=["hover"], framewise=True),
+                hv.opts.Curve(tools=["hover"], framewise=True),
                 hv.opts.Scatter(framewise=True))  # per element, or ranges stay at the first frame's
         return hv.DynamicMap(view, streams=[pointer, tap, range_xy, arrived])
 
