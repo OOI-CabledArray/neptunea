@@ -33,6 +33,8 @@ annotation features.
 """
 import panel as pn
 pn.extension('tabulator', loading_spinner='dots')
+if pn.config.nthreads is None:  # callbacks off the event loop: one session's S3 read doesn't stall the rest
+    pn.config.nthreads = 4
 
 import io
 import os
@@ -41,7 +43,9 @@ import ast
 import json
 import hashlib
 import datetime
+import time
 import asyncio
+import threading
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
@@ -56,6 +60,7 @@ import xarray as xr
 import holoviews as hv
 import hvplot.xarray  # noqa: F401  (registers .hvplot)
 import cmocean
+from diskcache import Index
 from holoviews.operation.datashader import rasterize
 from bokeh.models import DatetimeTickFormatter, DatetimeTicker, HoverTool
 
@@ -101,6 +106,7 @@ TM_COLORS = ["#1f78b4", "#a6cee3", "#b2df8a", "#33a02c", "#fb9a99", "#e31a1c",
              "#fdbf6f", "#ff7f00", "#cab2d6", "#6a3ba2", "#8c564b", "#7f7f7f"]
 
 fs = s3fs.S3FileSystem(anon=False)
+CACHE_DIR = Path.home() / ".cache/neptunea"  # disk caches: survive restarts and git pulls
 EXECUTOR = ThreadPoolExecutor(max_workers=4)
 # The rasterized image carries hover (time / value / count) at every zoom
 # level; individual points are only drawn once sparse enough to distinguish.
@@ -350,7 +356,7 @@ def product_instruments(key):
     return sites[(sites.site == m[1]) & (sites["product"] == kind)]
 
 
-@pn.cache
+@pn.cache(max_items=6, policy="LRU")  # an open 1 Hz stream holds ~2.5 GB of time index
 def get_dataset(s3_path):
     # chunks={} keeps arrays dask-backed (zarr chunking) so stream aggregation
     # runs partition-wise instead of loading whole variables into memory
@@ -648,11 +654,50 @@ def raw_sources(key, var):
 
 
 @pn.cache(max_items=32, policy="LRU")
+def stream_lazy(refdes):
+    """A stream opened without its time index or time decoding (which reads the
+    first and last chunk of every time variable), so reads touch only the
+    chunks they need; decode what you load with xr.decode_cf."""
+    return xr.open_zarr(fs.get_mapper(_stream_path(refdes)), consolidated=True, chunks={},
+                        create_default_indexes=False, decode_times=False)
+
+
+@lru_cache(maxsize=2)
+def chunk_times(refdes, k):
+    ds = stream_lazy(refdes)
+    s, size = sum(ds.time.chunks[0][:k]), ds.time.chunks[0][k]
+    return xr.decode_cf(xr.Dataset({"t": ds.time[s:s + size].load().variable})).t.values
+
+
+@lru_cache(maxsize=1024)
+def chunk_bounds(refdes, k):
+    t = chunk_times(refdes, k)
+    return t[0], t[-1]
+
+
+def time_position(refdes, ts):
+    """Index of `ts` in a stream (searchsorted), bisecting its time chunks:
+    ~5 chunk reads instead of the full index."""
+    sizes, ts = stream_lazy(refdes).time.chunks[0], np.datetime64(ts)
+    a, b = 0, len(sizes) - 1
+    while True:
+        k = (a + b) // 2
+        first, last = chunk_bounds(refdes, k)
+        if ts < first and k > a:
+            b = k - 1
+        elif ts > last and k < b:
+            a = k + 1
+        else:
+            return sum(sizes[:k]) + int(chunk_times(refdes, k).searchsorted(ts))
+
+
+@pn.cache(max_items=32, policy="LRU")
 def raw_cast(refdes, t0, t1, variables):
     """Raw `variables` and pressure from one cast window of a stream."""
-    ds = get_dataset(_stream_path(refdes))
+    ds = stream_lazy(refdes)
     pv = next(v for v in ("sea_water_pressure", "int_ctd_pressure") if v in ds)
-    return ds[[pv, *variables]].sel(time=slice(t0, t1)).load().rename({pv: "raw_pressure"})
+    lo, hi = time_position(refdes, t0), time_position(refdes, t1)
+    return xr.decode_cf(ds[[pv, *variables]].isel(time=slice(lo, hi)).load()).rename({pv: "raw_pressure"})
 
 
 def profile_inspector(source, da, tdim, range_xy, ts=(), raw=None, run=None):
@@ -814,6 +859,7 @@ def _to_timestamp(v):
 MID_CAP = 40_000_000
 TARGET_POINTS = 400_000
 OVERVIEW_WIDTH = 6000
+OVERVIEW_TTL = 7 * 86400
 
 STREAM_LAYERS = {  # QARTOD rollup flag value -> image style
     None: dict(cmap="kbc_r", cnorm="eq_hist"),
@@ -850,7 +896,7 @@ def _rasterize(data, var, x_range=None, y_range=None, width=1200):
                      width=width, height=400)
 
 
-@pn.cache(max_items=64)
+@pn.cache(max_items=500, to_disk=True, cache_path=CACHE_DIR, ttl=30 * 86400)
 def bulk_range(refdes, var, q=(0.01, 0.99)):
     """Range of the middle 98% of a stream's values (+5% pad), sampled from
     ~3 chunks spread across the record (S3 reads whole chunks, so sampling
@@ -870,11 +916,13 @@ def bulk_range(refdes, var, q=(0.01, 0.99)):
     return lo - pad, hi + pad
 
 
-@pn.cache(max_items=12, policy="LRU")
+@pn.cache(max_items=200, policy="LRU", to_disk=True, cache_path=CACHE_DIR, ttl=OVERVIEW_TTL)
 def stream_overview(refdes, var, flag, y_range):
     """Full-record raster over the stream's time span and a fixed y_range:
     spikes/fill values can't squash the real data into a few pixel rows, and
-    a flag with no points yields an empty layer instead of one at 1970."""
+    a flag with no points yields an empty layer instead of one at 1970.
+    Kept on disk for OVERVIEW_TTL, so it may lag appended data by that long;
+    zooms read live."""
     ds = get_dataset(_stream_path(refdes))
     fcol, idx = flag_col(ds, var), ds.indexes["time"]
     ddf = ds[[var] + ([fcol] if fcol else [])].unify_chunks().to_dask_dataframe()
@@ -882,6 +930,25 @@ def stream_overview(refdes, var, flag, y_range):
         ddf = ddf[ddf[fcol].astype(str).str.strip() == flag]
     return _rasterize(ddf, var, x_range=(idx[0].to_datetime64(), idx[-1].to_datetime64()),
                       y_range=y_range, width=OVERVIEW_WIDTH)
+
+
+def overview(*args):
+    """stream_overview, recording its arguments for warm_overviews."""
+    OVERVIEWS_USED[args] = time.time()
+    return stream_overview(*args)
+
+
+def warm_overviews(days=30):
+    """Recompute expired overviews used in the last `days`; once per server start."""
+    for args, used in list(OVERVIEWS_USED.items()):
+        if time.time() - used < days * 86400:
+            stream_overview(*args)
+
+
+OVERVIEWS_USED = Index(str(CACHE_DIR / "overviews_used"))
+if "warm" not in pn.state.cache:  # pn.state.cache is per server, the module runs per session
+    pn.state.cache["warm"] = threading.Thread(target=warm_overviews, daemon=True)
+    pn.state.cache["warm"].start()
 
 
 @lru_cache(maxsize=8)
@@ -919,7 +986,7 @@ def stream_layer(refdes, var, flag, label, overview_y):
                 y0, y1 = yr_ or (0.0, 1.0)
                 return hv.Image(([xr_[0], xr_[1]], [y0, y1],
                                  np.full((2, 2), np.nan)), ["time", var]).opts(**opts)
-        return stream_overview(refdes, var, flag, overview_y).opts(**opts)
+        return overview(refdes, var, flag, overview_y).opts(**opts)
 
     return hv.DynamicMap(view, streams=[hv.streams.RangeXY()])
 
@@ -1143,6 +1210,10 @@ class CuratedPanel(PanelBase):
             panels = [scatter_1d(da, tdim, style)]
         for o in overlays:
             panels = [p * o for p in panels]
+        if da.ndim == 2 and overlays:  # legend above the heatmap, not over it
+            panels = [p.opts(hv.opts.Overlay(legend_position="top", legend_cols=6, legend_opts=dict(
+                label_text_font_size="8pt", glyph_width=14, glyph_height=10, label_height=10,
+                spacing=0, padding=2, margin=0))) for p in panels]
         plot = panels[0] if len(panels) == 1 else hv.Layout(panels).cols(1)
         return plot, clims, notes, side
 
@@ -1384,7 +1455,7 @@ class StreamPanel(PanelBase):
                 notes.append("no QARTOD results variable for this parameter")
             overview_y = ylim or bulk_range(refdes, var)
             for f in flags:  # warm the overview cache here, off the event loop
-                stream_overview(refdes, var, f, overview_y)
+                overview(refdes, var, f, overview_y)
             with suppress(Exception):  # warm for annotation drafts; needs OOI credentials
                 parameter_ids(refdes)
             main = stream_layer(refdes, var, None, label, overview_y)

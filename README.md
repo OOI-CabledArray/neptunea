@@ -68,26 +68,32 @@ what `uv.lock` pins.
   climatology from `~/repos/qc-lookup` QARTOD tables.
 - Caching: curated product list and annotations refresh every 10 min; release
   manifests and files are kept until restart (releases are immutable); curated
-  variables load into memory; stream overviews are cached per
-  instrument/variable/flag/y-range after one full scan (~2 min).
+  variables load into memory; up to 6 open streams are kept. Stream overviews
+  (one full scan, ~2 min) and y-ranges persist in `~/.cache/neptunea` for 7 and
+  30 days; on start, overviews used in the last 30 days are recomputed in the
+  background if expired. Overviews may lag appended data by up to 7 days;
+  zooms read live.
+- Raw casts locate their window by bisecting the stream's time chunks (~4
+  chunk reads) rather than loading its time index.
+- Callbacks run on 4 threads (`pn.config.nthreads`), so a slow S3 read in one
+  session doesn't stall others.
 - Time Machine shifts prior years by 365-day multiples (~1 day leap drift per
   4 years, as in rca-data-tools).
 
 ## Roadmap
 
 1. POST drafted annotations to M2M behind a confirmation step
-2. Faster raw casts in the profile inspector: find the cast by bisecting the stream's time chunks instead of loading its full time index (first click per site reads ~675 MB of CTD time and holds ~2.5 GB RAM)
-3. Annotation table row → plot span linking
-4. `localRanges.yaml` as a third y-range option
-5. Persist stream overview caches to disk
-6. Nearest-neighbor comparison tab
+2. Annotation table row → plot span linking
+3. `localRanges.yaml` as a third y-range option
+4. Nearest-neighbor comparison tab
    - Pick an instrument; neighbors listed from `sitesDictionary.csv` (`nearestNeighbors`)
    - Overlay of both series on a shared hourly-median grid, plus a difference panel with deployment markers
    - Variables paired by `variableParameters.csv` standard names (e.g. PHSENH `ph_total` ↔ PHSEN `ph_seawater`)
    - Prototype on hard-coded pairs for science-lead review, then restore the `nearestNeighbors` column
    - Candidate pairs: co-located CTDs, PHSENH ↔ PHSEN, shallow-profiler CTD ↔ 200 m platform CTD, CTD oxygen ↔ standalone optodes
    - Once pairs settle: PNGs per pair in the static dashboard, and a Prefect difference check feeding alerts
-7. Curation review: follow the rca-cicoes-cresst release work
+5. Curation review: follow the rca-cicoes-cresst release work
    - Before/after curation lights up once a release publishes `ooi` / `qartod` levels
    - Check `hitl_masks` spans against the first release that carries them (v2026.10 doesn't)
    - Release notes and `build_report.json` (% removed per level and year) beside a build comparison, filtered to the variable
+6. Precomputed stream summaries (min/max/mean/count per 1 min / 1 h / 1 day bin) written by the harvest; see [docs/on_sharding_and_viz_performance.md](docs/on_sharding_and_viz_performance.md)
