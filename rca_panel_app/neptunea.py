@@ -467,9 +467,13 @@ DECISION_STYLE = {  # curation decision -> (span color, fill alpha)
 }
 
 
-def curation_overlay(key, da):
-    """HITL annotations and adjustments behind a curated product's variable,
-    one legend entry per decision. Release products use the annotations.csv
+def curation_overlay(key, da, y=None):
+    """curation_spans drawn as one legend entry per decision."""
+    return span_overlay(curation_spans(key, da), y)
+
+
+def curation_spans(key, da):
+    """HITL annotations and adjustments behind a curated product's variable. Release products use the annotations.csv
     and adjustments.csv published with them; older builds use rca-cicoes-cresst
     main (ledger.csv, adjustments.csv). Annotations come from the product's
     nodes; those on other instruments there are kept only when masked. Masks
@@ -530,15 +534,55 @@ def curation_overlay(key, da):
         "annotation": "",
     })])
     spans["dates"] = spans.begin.dt.strftime("%Y-%m-%d") + " → " + spans.end.dt.strftime("%Y-%m-%d")
+    return spans
+
+
+def span_overlay(spans, y=None):
+    """Spans, one legend entry per decision. With y=(lo, hi) they're drawn as
+    rectangles over that range: over a heatmap the image's hover hides VSpans'."""
     hover = HoverTool(tooltips=(
         '<div style="max-width:380px; white-space:normal">'
         "<b>@decision</b> &middot; @id &middot; @dates<br><i>@params</i><br>@rationale<br>@annotation</div>"))
     vdims = ["decision", "id", "params", "rationale", "annotation", "dates"]
+    el = (lambda g, d: hv.VSpans(g, kdims=["begin", "end"], vdims=vdims, label=d)) if y is None else (
+        lambda g, d: hv.Rectangles(g.assign(y0=y[0], y1=y[1]), kdims=["begin", "y0", "end", "y1"],
+                                   vdims=vdims, label=d))
     return hv.Overlay([
-        hv.VSpans(g, kdims=["begin", "end"], vdims=vdims, label=d).opts(
-            color=DECISION_STYLE[d][0], fill_alpha=DECISION_STYLE[d][1], line_alpha=0.6,
+        el(g, d).opts(
+            color=DECISION_STYLE[d.removesuffix(NOW)][0], fill_alpha=DECISION_STYLE[d.removesuffix(NOW)][1], line_alpha=0.6,
             line_width=1, tools=[hover])
         for d, g in spans.groupby("decision", sort=False)])
+
+
+# heatmap overlays: one compact legend row above the plot, not over the data
+LEGEND_ABOVE = hv.opts.Overlay(legend_position="top", legend_cols=6, legend_opts=dict(
+    label_text_font_size="8pt", glyph_width=14, glyph_height=10, label_height=10,
+    spacing=0, padding=2, margin=0))
+EXPLAINS = ["mask", "mask (other variables)", "adjustment"]  # decisions that remove or change data
+NOW = " (current ledger)"  # older builds: decision may differ from the one the build applied
+
+
+def build_spans(key, da):
+    """curation_spans for explaining a build's removals. Older builds don't
+    record their ledger, so every decision is kept, marked as today's."""
+    spans = curation_spans(key, da)
+    return spans if release_of(key) else spans.assign(decision=spans.decision + NOW)
+
+
+def explaining(spans, times):
+    """Spans that could explain a removal (mask/adjustment, or any decision
+    from the current ledger) covering any of `times` (sorted)."""
+    s, t = spans[spans.decision.isin(EXPLAINS) | spans.decision.str.endswith(NOW)], np.asarray(times)
+    return s[np.searchsorted(t, s.end.values, "right") > np.searchsorted(t, s.begin.values, "left")]
+
+
+def explain(times, spans):
+    """Per time, the mask/adjustment spans covering it, as hover text."""
+    text = np.full(len(times), "", dtype=object)
+    for r in explaining(spans, times).itertuples():
+        text[(times >= r.begin) & (times <= r.end)] += f"<b>{r.decision}</b> {r.id}: {r.rationale[:160]}<br>"
+    text[text == ""] = "no mask or adjustment covers this time"
+    return text
 
 
 def mask_gaps(da, tdim, factor=3.0):
@@ -816,19 +860,22 @@ def compare_1d(a, cmp, tdim, style, overlays=()):
     `overlays` (spans, markers) go on every panel."""
     label = style["label"]
 
-    def points(da, name, color, size):
+    def points(da, name, color, size, spans=None):
         da = da.dropna(tdim)
-        hover = HoverTool(
-            tooltips=[("series", name), ("time", f"@{tdim}{{%F %H:%M}}"), (label, f"@{{{da.name}}}")],
-            formatters={f"@{tdim}": "datetime"},
-        )
-        return hv.Scatter((da[tdim].values, da.values), tdim, da.name, label=name).opts(
-            color=color, size=size, tools=[hover])
+        t = da[tdim].values
+        tips = [("series", name), ("time", f"@{tdim}{{%F %H:%M}}"), (label, f"@{{{da.name}}}")]
+        cols, vdims = (t, da.values), [da.name]
+        if spans is not None:  # annotations that explain the difference
+            tips.append(("curation", '<div style="max-width:380px; white-space:normal">@why{safe}</div>'))
+            cols, vdims = (t, da.values, explain(t, spans)), [da.name, "why"]
+        hover = HoverTool(tooltips=tips, formatters={f"@{tdim}": "datetime"})
+        return hv.Scatter(cols, tdim, vdims, label=name).opts(color=color, size=size, tools=[hover])
 
     main = points(cmp["b"], cmp["label_b"], "#bdbdbd", 3) * points(a, cmp["label_a"], POINT_COLOR, 2)
-    for name, color, d in cmp["removed"] + cmp["added"]:
+    for (name, color, d), spans in ([(r, cmp["why_removed"]) for r in cmp["removed"]]
+                                    + [(r, cmp["why_added"]) for r in cmp["added"]]):
         if d.notnull().any():  # empty categories would still add legend entries
-            main = main * points(d, name, color, 5)
+            main = main * points(d, name, color, 5, spans)
     panels = [(main, dict(ylabel=label, legend_position="top_left", min_height=300))]
     if cmp["diff"] is not None:  # time axis on the A − B panel only
         panels[0][1].update(xaxis="bare")
@@ -1199,6 +1246,15 @@ class CuratedPanel(PanelBase):
                 notes.append("can't compare a profile product with a time series")
             else:
                 cmp = compare_arrays(name, other, var, datasets)
+                # removals from B to A are explained by A's curation, and the reverse
+                cmp["why_removed"] = cmp["why_added"] = None
+                try:
+                    if cmp["removed"]:
+                        cmp["why_removed"] = build_spans(name, da)
+                    if cmp["added"]:
+                        cmp["why_added"] = build_spans(other, cmp["b"])
+                except Exception as e:
+                    notes.append(f"annotations for differences unavailable: {e}")
         overlays = self._overlays(name, da, notes)
         if da.ndim == 2:
             q = [float(v) for v in da.quantile([0.001, 0.02, 0.98, 0.999]).values]
@@ -1216,10 +1272,8 @@ class CuratedPanel(PanelBase):
             panels = [scatter_1d(da, tdim, style)]
         for o in overlays:
             panels = [p * o for p in panels]
-        if da.ndim == 2 and overlays:  # legend above the heatmap, not over it
-            panels = [p.opts(hv.opts.Overlay(legend_position="top", legend_cols=6, legend_opts=dict(
-                label_text_font_size="8pt", glyph_width=14, glyph_height=10, label_height=10,
-                spacing=0, padding=2, margin=0))) for p in panels]
+        if da.ndim == 2 and overlays:
+            panels = [p.opts(LEGEND_ABOVE) for p in panels]
         return panels, clims, notes, side
 
     def _overlays(self, name, da, notes):
@@ -1234,7 +1288,8 @@ class CuratedPanel(PanelBase):
                 notes.append(f"deployments unavailable: {e}")
         if self.anno_toggle.value:
             try:
-                overlays.append(curation_overlay(name, da))
+                p = da["sea_water_pressure"] if da.ndim == 2 else None
+                overlays.append(curation_overlay(name, da, None if p is None else (float(p.min()), float(p.max()))))
                 # releases carry their own decisions; older builds are drawn from main
                 built = get_dataset(discover_curated()[name]).attrs.get("hitl_ledger_sha1")
                 if not release_of(name) and built and built != ledger_sha():
@@ -1274,10 +1329,19 @@ class CuratedPanel(PanelBase):
                   heatmap(gaps(b, tb), tb, style, cmap, clim, hv.streams.RangeXY(),
                           title=cmp["label_b"], **{**extra, **(upper if change is not None else {})})]
         if change is not None:
-            panels.append(heatmap(
+            # hoverable annotation spans behind the changed columns
+            why = [explaining(spans, change[tdim].values[(change == v).any("sea_water_pressure").values])
+                   for v, spans in ((1, cmp["why_removed"]), (2, cmp["why_added"])) if spans is not None]
+            why = pd.concat(why).drop_duplicates("id") if why else []
+            panel = heatmap(
                 gaps(change, tdim), tdim, dict(label="change (1 = only B, 2 = only A)"),
                 ["#d62728", "#009E73"], (1, 2), hv.streams.RangeXY(), colorbar=False,
-                title=f"red: only in {cmp['label_b']} · green: only in {cmp['label_a']}", **extra))
+                title=f"red: only in {cmp['label_b']} · green: only in {cmp['label_a']}",
+                **{**extra, **(dict(min_height=320, tools=[]) if len(why) else {})})  # span hover only
+            if len(why):
+                p = change["sea_water_pressure"]
+                panel = (panel * span_overlay(why, (float(p.min()), float(p.max())))).opts(LEGEND_ABOVE)
+            panels.append(panel)
         return panels
 
     def _show(self, result):

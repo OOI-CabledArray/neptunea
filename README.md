@@ -30,7 +30,9 @@ see [deploy/README.md](deploy/README.md).
     colored (removed by QARTOD / HITL + adjustments / advanced pH, or only in
     one build), and an A − B panel when the grids overlap. Heatmaps: both
     products with linked zoom, plus a changes panel for builds/levels of one
-    product.
+    product. Hovering a difference shows the mask or adjustment annotations
+    that cover it (A's for points A dropped, B's for points B dropped), or
+    that none does.
   - **Annotations** — HITL annotations and adjustments colored by curation
     decision (mask / ignore / superseded / adjustment; legend toggles each),
     rationale on hover. Releases use their own `annotations.csv` /
