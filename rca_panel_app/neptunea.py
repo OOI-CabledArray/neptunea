@@ -830,10 +830,11 @@ def compare_1d(a, cmp, tdim, style, overlays=()):
         if d.notnull().any():  # empty categories would still add legend entries
             main = main * points(d, name, color, 5)
     panels = [(main, dict(ylabel=label, legend_position="top_left", min_height=300))]
-    if cmp["diff"] is not None:
+    if cmp["diff"] is not None:  # time axis on the A − B panel only
+        panels[0][1].update(xaxis="bare")
         diff = points(cmp["diff"], f"{cmp['label_a']} − {cmp['label_b']}", "#009E73", 2) \
             * hv.HLine(0).opts(color="gray", line_width=1)
-        panels.append((diff, dict(ylabel=f"Δ {label}", min_height=150)))
+        panels.append((diff, dict(ylabel="A − B", min_height=200, yticks=4)))
     out = []
     for p, opts in panels:  # overlays first: an Overlay's options don't survive another *
         for o in overlays:
@@ -1135,10 +1136,15 @@ class CuratedPanel(PanelBase):
                                      self.deploy_toggle, self.anno_toggle, self.profile_toggle))
         self.layout.insert(2, self.clim_row)
         self.layout.insert(3, self.note_pane)
-        self.layout[-1] = pn.Row(self.plot_pane, self.profile_box, sizing_mode="stretch_width")
+        # stacked panels as separate panes (an hv.Layout collapses beside the profile panes);
+        # Panel links their axes when they share dimensions and shared_axes
+        self.more_box = pn.Column(sizing_mode="stretch_width", margin=0)
+        self.layout[-1] = pn.Row(pn.Column(self.plot_pane, self.more_box, sizing_mode="stretch_width"),
+                                 self.profile_box, sizing_mode="stretch_width")
 
     def clear(self):
         super().clear()
+        self.more_box.objects = []
         self.profile_box.objects = []
 
     def _replot(self):
@@ -1214,8 +1220,7 @@ class CuratedPanel(PanelBase):
             panels = [p.opts(hv.opts.Overlay(legend_position="top", legend_cols=6, legend_opts=dict(
                 label_text_font_size="8pt", glyph_width=14, glyph_height=10, label_height=10,
                 spacing=0, padding=2, margin=0))) for p in panels]
-        plot = panels[0] if len(panels) == 1 else hv.Layout(panels).cols(1)
-        return plot, clims, notes, side
+        return panels, clims, notes, side
 
     def _overlays(self, name, da, notes):
         """Deployment markers and curation spans, as toggled; failures become notes."""
@@ -1252,19 +1257,23 @@ class CuratedPanel(PanelBase):
             return [heatmap(gaps(da, tdim), tdim, style, cmap, clim, rng)]
         b, tb = cmp["b"], time_dim(cmp["b"])
         extra = dict(shared_axes=cmp["same_product"], min_height=260)
-        panels = [heatmap(gaps(da, tdim), tdim, style, cmap, clim, rng, title=cmp["label_a"], **extra),
-                  heatmap(gaps(b, tb), tb, style, cmap, clim, hv.streams.RangeXY(),
-                          title=cmp["label_b"], **extra)]
+        change = None
         if cmp["same_product"]:
             # 1 = only B has data, 2 = only A has; the sets are disjoint
             masks = xr.align(*[d.notnull() for _, _, d in cmp["removed"] + cmp["added"]],
                              join="outer", fill_value=False)
             only_b = sum(masks[:len(cmp["removed"])]) > 0
             only_a = sum(masks[len(cmp["removed"]):]) > 0 if cmp["added"] else xr.zeros_like(only_b)
-            if not (only_b.any() or only_a.any()):
+            if only_b.any() or only_a.any():
+                change = xr.where(only_b, 1.0, xr.where(only_a, 2.0, np.nan)).rename("change")
+            else:
                 notes.append(f"no cells differ in coverage between {cmp['label_a']} and {cmp['label_b']}")
-                return panels
-            change = xr.where(only_b, 1.0, xr.where(only_a, 2.0, np.nan)).rename("change")
+        # stacked panels: time axis on the bottom one only (shared zoom), else ticks without the label
+        upper = dict(xaxis="bare", min_height=200) if cmp["same_product"] else dict(xlabel="")
+        panels = [heatmap(gaps(da, tdim), tdim, style, cmap, clim, rng, title=cmp["label_a"], **{**extra, **upper}),
+                  heatmap(gaps(b, tb), tb, style, cmap, clim, hv.streams.RangeXY(),
+                          title=cmp["label_b"], **{**extra, **(upper if change is not None else {})})]
+        if change is not None:
             panels.append(heatmap(
                 gaps(change, tdim), tdim, dict(label="change (1 = only B, 2 = only A)"),
                 ["#d62728", "#009E73"], (1, 2), hv.streams.RangeXY(), colorbar=False,
@@ -1275,7 +1284,7 @@ class CuratedPanel(PanelBase):
         if result is None:
             self.note_pane.visible = False
             return
-        plot, clims, notes, side = result
+        panels, clims, notes, side = result
         self.note_pane.object = "⚠ " + "; ".join(notes) if notes else ""
         self.note_pane.visible = bool(notes)
         side, self._tap = side or (None, None)
@@ -1298,7 +1307,8 @@ class CuratedPanel(PanelBase):
             reset = dict(value=clims["standard"]) if key != self._clim_key else {}
             self._clim_key = key
             self.clim_slider.param.update(start=lo, end=hi, step=(hi - lo) / 500, **reset)
-        self.plot_pane.object = plot
+        self.plot_pane.object = panels[0]
+        self.more_box.objects = [pn.pane.HoloViews(p, sizing_mode="stretch_width") for p in panels[1:]]
 
 
 QC_FLAG_OPTIONS = ["suspect", "fail", "not_operational", "not_available", "pass"]
