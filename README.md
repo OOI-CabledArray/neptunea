@@ -40,6 +40,10 @@ see [deploy/README.md](deploy/README.md).
     wildcards and salinity inheritance resolved); older builds use
     [rca-cicoes-cresst](https://github.com/ooi-data/rca-cicoes-cresst) main and
     warn when the ledger has changed since the build.
+  - **Links** — `/neptunea?product=<name>&var=<variable>&start=<date>&end=<date>`
+    opens the newest release of the product (at `&level=`, default `hitl`),
+    compared with its lowest level, annotations on, zoomed to start–end.
+    rca-cicoes-cresst's `review-annotations` links each ledger row this way.
 - **Full Time Series** — any `ooi-data` stream at native resolution, hoverable
   at every zoom. Y-range: params standard or Auto (middle 98%, so spikes don't
   flatten the view). Overlays: annotations, deployments, QARTOD flags,

@@ -160,12 +160,13 @@ def refdes_groups():
     return {"": ["-- Select --"], **groups}
 
 
-def select_first(select, options, refresh):
-    """Load `options` and pick the first. Calls `refresh` when the value is
-    unchanged (same variable name in a new source), since no watcher fires."""
+def select_first(select, options, refresh, prefer=None):
+    """Load `options` and pick `prefer` if offered, else the first. Calls `refresh`
+    when the value is unchanged (same variable name in a new source), since no
+    watcher fires."""
     old = select.value
     select.options = options
-    select.value = options[0] if options else None
+    select.value = prefer if prefer in options else options[0] if options else None
     if select.value == old:
         refresh()
 
@@ -1172,6 +1173,7 @@ class CuratedPanel(PanelBase):
         self.clim_row = pn.Row(self.clim_slider, self.clim_std_btn, self.clim_auto_btn,
                                visible=False)
         self._clims, self._clim_key, self._view = {}, None, None
+        self._link = {}  # dataset, var and time window from a URL (open_link)
         self.dataset_select.param.watch(self._dataset_changed, "value")
         self.var_select.param.watch(self._var_changed, "value")
         for w in (self.compare_select, self.mask_toggle, self.deploy_toggle, self.anno_toggle,
@@ -1208,8 +1210,28 @@ class CuratedPanel(PanelBase):
             self.note_pane.visible = False
             self.clear()
             return
+        prefer = self._link.get("var") if event.new == self._link.get("dataset") else None
         self.run(lambda: list(get_dataset(datasets[event.new]).data_vars),
-                 apply=lambda names: select_first(self.var_select, names, self._replot))
+                 apply=lambda names: select_first(self.var_select, names, self._replot, prefer))
+
+    def open_link(self, args):
+        """Open ?product=&var=&start=&end=[&level=] (links from rca-cicoes-cresst
+        review-annotations): the newest release of the product at `level` (default
+        hitl, else its highest), compared with its lowest level, curation overlay on,
+        zoomed to start–end."""
+        keys = [k for k in discover_curated() if release_of(k) and product_key(k)[1] == args.get("product")]
+        if not keys:
+            return
+        levels = {product_key(k)[2]: k for k in keys if product_key(k)[0] == product_key(keys[0])[0]}
+        by_qc = sorted(levels, key=QC_LEVELS.index)
+        key = levels.get(args.get("level", "hitl"), levels[by_qc[-1]])
+        xlim = tuple(np.datetime64(pd.Timestamp(args[k]).tz_localize(None)) for k in ("start", "end")
+                     ) if "start" in args and "end" in args else None
+        self._link = dict(dataset=key, var=args.get("var"), xlim=xlim)
+        self.anno_toggle.value = True
+        self.dataset_select.value = key
+        if levels[by_qc[0]] != key:
+            self.compare_select.value = levels[by_qc[0]]
 
     def _var_changed(self, event):
         if not event.new:
@@ -1274,6 +1296,8 @@ class CuratedPanel(PanelBase):
             panels = [p * o for p in panels]
         if da.ndim == 2 and overlays:
             panels = [p.opts(LEGEND_ABOVE) for p in panels]
+        if self._link.get("xlim") and (name, var) == (self._link["dataset"], self._link["var"]):
+            panels = [p.opts(xlim=self._link["xlim"]) for p in panels]
         return panels, clims, notes, side
 
     def _overlays(self, name, da, notes):
@@ -1799,22 +1823,28 @@ class MetadataPanel(PanelBase):
         self.run(lambda: get_dataset(path)._repr_html_())
 
 
-def multi_panel_tab(panel_cls):
-    """Column of removable panels with an add button."""
+def multi_panel_tab(panel_cls, setup=None):
+    """Column of removable panels with an add button; `setup` runs on the first
+    panel once the page has loaded."""
     column = pn.Column(sizing_mode="stretch_width")
     def remove(p):
         p.close()
         column.remove(p.layout)
     def add(event=None):
-        column.append(panel_cls(on_remove=remove).layout)
+        p = panel_cls(on_remove=remove)
+        column.append(p.layout)
+        return p
     btn = pn.widgets.Button(name="+ Add panel", button_type="primary", width=150)
     btn.on_click(add)
-    add()
+    first = add()
+    if setup:
+        pn.state.onload(lambda: setup(first))
     return pn.Column(btn, column, sizing_mode="stretch_width")
 
 
+url_args = {k: v[0].decode() for k, v in pn.state.session_args.items()}
 tabs = pn.Tabs(
-    ("Curated Products", multi_panel_tab(CuratedPanel)),
+    ("Curated Products", multi_panel_tab(CuratedPanel, setup=(lambda p: p.open_link(url_args)) if url_args else None)),
     ("Full Time Series", multi_panel_tab(StreamPanel)),
     ("Time Machine", TimeMachinePanel().layout),
     ("Annotations", AnnotationBrowser().layout),
