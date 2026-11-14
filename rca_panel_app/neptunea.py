@@ -1220,7 +1220,9 @@ class CuratedPanel(PanelBase):
         hitl, else its highest), compared with its lowest level, curation overlay on,
         zoomed to start–end."""
         keys = [k for k in discover_curated() if release_of(k) and product_key(k)[1] == args.get("product")]
+        print(f"[neptunea] link {args} -> {len(keys)} release products", flush=True)
         if not keys:
+            self.note_pane.param.update(object=f"⚠ no released product named {args.get('product')!r}", visible=True)
             return
         levels = {product_key(k)[2]: k for k in keys if product_key(k)[0] == product_key(keys[0])[0]}
         by_qc = sorted(levels, key=QC_LEVELS.index)
@@ -1825,7 +1827,8 @@ class MetadataPanel(PanelBase):
 
 def multi_panel_tab(panel_cls, setup=None):
     """Column of removable panels with an add button; `setup` runs on the first
-    panel once the page has loaded."""
+    panel while the page is built (not onload: with nthreads that waits on the
+    shared thread pool)."""
     column = pn.Column(sizing_mode="stretch_width")
     def remove(p):
         p.close()
@@ -1838,7 +1841,7 @@ def multi_panel_tab(panel_cls, setup=None):
     btn.on_click(add)
     first = add()
     if setup:
-        pn.state.onload(lambda: setup(first))
+        setup(first)
     return pn.Column(btn, column, sizing_mode="stretch_width")
 
 
