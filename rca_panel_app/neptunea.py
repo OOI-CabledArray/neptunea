@@ -1217,23 +1217,19 @@ class CuratedPanel(PanelBase):
     def open_link(self, args):
         """Open ?product=&var=&start=&end=[&level=] (links from rca-cicoes-cresst
         review-annotations): the newest release of the product at `level` (default
-        hitl, else its highest), compared with its lowest level, curation overlay on,
-        zoomed to start–end."""
+        its lowest, so masked data still show), curation overlay on, zoomed to start–end."""
         keys = [k for k in discover_curated() if release_of(k) and product_key(k)[1] == args.get("product")]
         print(f"[neptunea] link {args} -> {len(keys)} release products", flush=True)
         if not keys:
             self.note_pane.param.update(object=f"⚠ no released product named {args.get('product')!r}", visible=True)
             return
         levels = {product_key(k)[2]: k for k in keys if product_key(k)[0] == product_key(keys[0])[0]}
-        by_qc = sorted(levels, key=QC_LEVELS.index)
-        key = levels.get(args.get("level", "hitl"), levels[by_qc[-1]])
+        key = levels.get(args.get("level"), levels[min(levels, key=QC_LEVELS.index)])
         xlim = tuple(np.datetime64(pd.Timestamp(args[k]).tz_localize(None)) for k in ("start", "end")
                      ) if "start" in args and "end" in args else None
         self._link = dict(dataset=key, var=args.get("var"), xlim=xlim)
         self.anno_toggle.value = True
         self.dataset_select.value = key
-        if levels[by_qc[0]] != key:
-            self.compare_select.value = levels[by_qc[0]]
 
     def _var_changed(self, event):
         if not event.new:
