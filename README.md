@@ -24,7 +24,7 @@ see [deploy/README.md](deploy/README.md).
     variable's instrument (pH/pCO2 on the downcast, with sample count and
     largest pressure gap) and raw CTD T/S over the same window. "Follow hover"
     unpins.
-  - **Compare** against the same product at a lower QC level (`ooi` → `qartod`
+  - **Compare** against the same product at a lower or higher QC level (`ooi` → `qartod`
     → `hitl` → `advanced`), another release/build, or another product in the
     same release. Time series: the comparison in gray, points only one side has
     colored (removed by QARTOD / HITL + adjustments / advanced pH, or only in

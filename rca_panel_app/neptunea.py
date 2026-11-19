@@ -301,13 +301,16 @@ def compare_arrays(key_a, key_b, var, datasets):
     removed, added = [], []
     if (fa, pa) == (fb, pb):
         levels = {product_key(k)[2]: k for k in datasets if product_key(k)[:2] == (fa, pa)}
-        chain = [lvl for lvl in QC_LEVELS[QC_LEVELS.index(lb):QC_LEVELS.index(la) + 1] if lvl in levels]
+        i, j = sorted((QC_LEVELS.index(la), QC_LEVELS.index(lb)))
+        chain = [lvl for lvl in QC_LEVELS[i:j + 1] if lvl in levels]
+        # what each step removes is in the lower level only: B when A is the higher level, else A
+        steps_out = removed if QC_LEVELS.index(la) > QC_LEVELS.index(lb) else added
         for lo, hi in zip(chain, chain[1:]):
             steps = QC_LEVELS[QC_LEVELS.index(lo) + 1:QC_LEVELS.index(hi) + 1]
             before, after = xr.align(load_var(datasets[levels[lo]], var),
                                      load_var(datasets[levels[hi]], var), join="outer")
-            removed.append(("removed by " + " + ".join(LEVEL_STEPS[s][0] for s in steps),
-                            LEVEL_STEPS[hi][1], before.where(after.isnull())))
+            steps_out.append(("removed by " + " + ".join(LEVEL_STEPS[s][0] for s in steps),
+                              LEVEL_STEPS[hi][1], before.where(after.isnull())))
         label_a, label_b = la, lb
     else:
         label_a, label_b = ((build_label(key_a), build_label(key_b)) if pa == pb
@@ -1339,9 +1342,11 @@ class CuratedPanel(PanelBase):
             # 1 = only B has data, 2 = only A has; the sets are disjoint
             masks = xr.align(*[d.notnull() for _, _, d in cmp["removed"] + cmp["added"]],
                              join="outer", fill_value=False)
-            only_b = sum(masks[:len(cmp["removed"])]) > 0
-            only_a = sum(masks[len(cmp["removed"]):]) > 0 if cmp["added"] else xr.zeros_like(only_b)
-            if only_b.any() or only_a.any():
+            k = len(cmp["removed"])
+            if masks:  # either side may be empty (comparing against a higher or lower level)
+                zero = xr.zeros_like(masks[0])
+                only_b, only_a = sum(masks[:k], zero) > 0, sum(masks[k:], zero) > 0
+            if masks and (only_b.any() or only_a.any()):
                 change = xr.where(only_b, 1.0, xr.where(only_a, 2.0, np.nan)).rename("change")
             else:
                 notes.append(f"no cells differ in coverage between {cmp['label_a']} and {cmp['label_b']}")
