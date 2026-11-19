@@ -251,10 +251,16 @@ def menu_label(key):
     return f"{product} · {level}" if release_of(key) else key.rpartition("/")[2]
 
 
+def qc_order(key):
+    """Sort key: product, then QC level in processing order (not alphabetical)."""
+    _, product, level = product_key(key)
+    return product, QC_LEVELS.index(level)
+
+
 def curated_groups(keys):
-    """Select groups per build: {build: {name: key}}."""
-    groups = {}
-    for k in keys:
+    """Select groups per build: {build: {name: key}}, levels in QC order."""
+    groups = {product_key(k)[0]: {} for k in keys}  # builds keep discovery order
+    for k in sorted(keys, key=qc_order):
         groups.setdefault(product_key(k)[0], {})[menu_label(k)] = k
     return groups
 
@@ -270,17 +276,17 @@ def build_label(key):
 
 
 def compare_groups(key, keys):
-    """Compare-select groups for `key`: the same product at lower QC levels of
-    the same build, the same product and level in other builds, then other
-    products of the same build."""
+    """Compare-select groups for `key`: the same product at other QC levels of
+    the same build (in QC order), the same product and level in other builds,
+    then other products of the same build."""
     build, product, level = product_key(key)
     groups = {"": {"None": ""}}
-    for k in keys:
+    for k in sorted(keys, key=lambda k: (product_key(k)[0] != build, *qc_order(k))):
         b, p, lvl = product_key(k)
         if k == key:
             continue
-        if (b, p) == (build, product) and QC_LEVELS.index(lvl) < QC_LEVELS.index(level):
-            groups.setdefault("Lower QC level", {})[lvl] = k
+        if (b, p) == (build, product):
+            groups.setdefault("Other QC levels", {})[lvl] = k
         elif (p, lvl) == (product, level):
             groups.setdefault("Other builds", {})[build_label(k)] = k
         elif b == build:
@@ -538,8 +544,9 @@ def curation_spans(key, da):
 
 # fixed plot borders so stacked panels' time axes line up with the annotation
 # track: room for the y label on the left, the heatmap colorbar on the right
-BORDERS_2D = {"plot.min_border_left": 80, "plot.min_border_right": 110}
-BORDERS_1D = {"plot.min_border_left": 80, "plot.min_border_right": 10}
+BORDERS_2D = {"plot.min_border_left": 80, "plot.min_border_right": 110,
+              "plot.min_border_top": 4, "plot.min_border_bottom": 4}
+BORDERS_1D = {**BORDERS_2D, "plot.min_border_right": 10}
 TRACK_LANES = {"mask": "mask", "adjustment": "adjust", "mask (other variables)": "other vars",
                "superseded": "superseded", "ignore": "ignore"}  # decision -> lane label, top first
 
@@ -1217,6 +1224,7 @@ class CuratedPanel(PanelBase):
         # stacked panels as separate panes (an hv.Layout collapses beside the profile panes);
         # Panel links their axes when they share dimensions and shared_axes
         self.more_box = pn.Column(sizing_mode="stretch_width", margin=0)
+        self.plot_pane.margin = (5, 10, 0, 10)  # no gap above the stacked panels below
         self.layout[-1] = pn.Row(pn.Column(self.plot_pane, self.more_box, sizing_mode="stretch_width"),
                                  self.profile_box, sizing_mode="stretch_width")
 
@@ -1424,7 +1432,8 @@ class CuratedPanel(PanelBase):
             self._clim_key = key
             self.clim_slider.param.update(start=lo, end=hi, step=(hi - lo) / 500, **reset)
         self.plot_pane.object = panels[0]
-        self.more_box.objects = [pn.pane.HoloViews(p, sizing_mode="stretch_width") for p in panels[1:]]
+        self.more_box.objects = [pn.pane.HoloViews(p, sizing_mode="stretch_width", margin=(0, 10))
+                                 for p in panels[1:]]
 
 
 QC_FLAG_OPTIONS = ["suspect", "fail", "not_operational", "not_available", "pass"]
