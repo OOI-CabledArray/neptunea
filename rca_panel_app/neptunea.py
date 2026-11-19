@@ -1460,7 +1460,8 @@ class CuratedPanel(PanelBase):
                 title=f"red: only in {cmp['label_b']} · green: only in {cmp['label_a']}",
                 **{**extra, **(upper if bare else {})})
             panels.append(panel)
-        return panels
+        # one pressure label for the stack, on the middle panel
+        return [p if i == (len(panels) - 1) // 2 else p.opts(ylabel="") for i, p in enumerate(panels)]
 
     def _show(self, result):
         if result is None:
