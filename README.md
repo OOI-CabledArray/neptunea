@@ -30,12 +30,13 @@ see [deploy/README.md](deploy/README.md).
     colored (removed by QARTOD / HITL + adjustments / advanced pH, or only in
     one build), and an A − B panel when the grids overlap. Heatmaps: both
     products with linked zoom, plus a changes panel for builds/levels of one
-    product. Hovering a difference shows the mask or adjustment annotations
-    that cover it (A's for points A dropped, B's for points B dropped), or
-    that none does.
-  - **Annotations** — HITL annotations and adjustments colored by curation
-    decision (mask / ignore / superseded / adjustment; legend toggles each),
-    rationale on hover. Releases use their own `annotations.csv` /
+    product. Hovering a time series difference shows the mask or adjustment
+    annotations that cover it (A's for points A dropped, B's for points B
+    dropped), or that none does.
+  - **Annotations** — a track under the panels, sharing their time axis: HITL
+    annotations and adjustments as bars packed into non-overlapping lanes,
+    grouped by curation decision (mask, adjust, other vars, superseded,
+    ignore), rationale on hover. Releases use their own `annotations.csv` /
     `adjustments.csv` and the per-variable `hitl_masks` attribute (node
     wildcards and salinity inheritance resolved); older builds use
     [rca-cicoes-cresst](https://github.com/ooi-data/rca-cicoes-cresst) main and
