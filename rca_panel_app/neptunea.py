@@ -50,6 +50,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from functools import lru_cache, partial
+from urllib.parse import urlencode
 from pathlib import Path
 
 import s3fs
@@ -276,22 +277,24 @@ def build_label(key):
 
 
 def compare_groups(key, keys):
-    """Compare-select groups for `key`: the same product at other QC levels of
-    the same build (in QC order), the same product and level in other builds,
-    then other products of the same build."""
+    """Compare-select groups for `key`, closest first: the same product (same
+    sensors) at other QC levels of the build, in QC order; the same product and
+    level in other builds; then other products of the build."""
     build, product, level = product_key(key)
-    groups = {"": {"None": ""}}
+    levels, builds, others = {}, {}, {}
     for k in sorted(keys, key=lambda k: (product_key(k)[0] != build, *qc_order(k))):
         b, p, lvl = product_key(k)
         if k == key:
             continue
         if (b, p) == (build, product):
-            groups.setdefault("Other QC levels", {})[lvl] = k
+            levels[lvl] = k
         elif (p, lvl) == (product, level):
-            groups.setdefault("Other builds", {})[build_label(k)] = k
+            builds[build_label(k)] = k
         elif b == build:
-            groups.setdefault("Other products", {})[menu_label(k)] = k
-    return groups
+            others[menu_label(k)] = k
+    groups = {"": {"None": ""}, f"Same sensors · {product} at other QC levels": levels,
+              f"Same product · other builds": builds, "Other products": others}
+    return {g: v for g, v in groups.items() if v}
 
 
 def compare_arrays(key_a, key_b, var, datasets):
@@ -584,8 +587,8 @@ def annotation_track(spans, x0, x1, source, xlim=None, borders=BORDERS_1D):
         return hv.Rectangles(bars, kdims=["begin", "y0", "end", "y1"], vdims=vdims).opts(
             xlim=(lo, hi), ylim=(-len(lanes), 0), yticks=ticks, color="color", line_color="color",
             alpha=0.75, tools=[hover], default_tools=[], xlabel="Time", ylabel="",
-            responsive=True, height=15 * len(lanes) + 50, show_grid=True, framewise=True,
-            fontsize={"yticks": "8pt"}, backend_opts=borders, **DATETIME_OPTS)
+            responsive=True, height=12 * len(lanes) + 50, show_grid=True, framewise=True,
+            fontsize={"yticks": "7pt"}, backend_opts=borders, **DATETIME_OPTS)
 
     return hv.DynamicMap(view, streams=[hv.streams.RangeX(source=source)])
 
@@ -1204,21 +1207,32 @@ class CuratedPanel(PanelBase):
             format="0[.]000", width=340)
         self.clim_std_btn = pn.widgets.Button(name="Standard", width=90, align="end")
         self.clim_auto_btn = pn.widgets.Button(name="Fit view (2–98%)", width=130, align="end")
-        self.clim_std_btn.on_click(lambda e: self.clim_slider.param.update(value=self._clims["standard"]))
+        self.clim_std_btn.on_click(lambda e: self._set_clim(self._clims["standard"]))
         self.clim_auto_btn.on_click(lambda e: self._fit_view())
         self.clim_row = pn.Row(self.clim_slider, self.clim_std_btn, self.clim_auto_btn,
                                visible=False)
         self._clims, self._clim_key, self._view = {}, None, None
-        self._link = {}  # dataset, var and time window from a URL (open_link)
+        self._link = {}  # view from a URL (open_link)
+        # the current view as a query string, kept in a hidden widget so the
+        # button copies it in the click itself (clipboard needs a user gesture)
+        self.link_text = pn.widgets.TextInput(visible=False)
+        self.link_btn = pn.widgets.Button(name="🔗 Copy link", width=110, align="end")
+        self.link_btn.js_on_click(args={"q": self.link_text, "btn": self.link_btn}, code="""
+            navigator.clipboard.writeText(window.location.origin + window.location.pathname + "?" + q.value);
+            btn.label = "✓ Copied"; setTimeout(() => { btn.label = "🔗 Copy link" }, 1500);""")
+        self._range = None  # RangeXY of the top panel
         self.dataset_select.param.watch(self._dataset_changed, "value")
         self.var_select.param.watch(self._var_changed, "value")
         for w in (self.compare_select, self.mask_toggle, self.deploy_toggle, self.anno_toggle,
                   self.profile_toggle):
             w.param.watch(lambda e: self._replot(), "value")
+        for w in (self.cmap_select, self.clim_slider):
+            w.param.watch(lambda e: self._update_link(), "value")
         self.layout = self.build_layout(
             self.dataset_select, self.var_select, self.cmap_select)
         self.layout.insert(1, pn.Row(self.compare_select, self.mask_toggle,
-                                     self.deploy_toggle, self.anno_toggle, self.profile_toggle))
+                                     self.deploy_toggle, self.anno_toggle, self.profile_toggle,
+                                     self.link_btn, self.link_text))
         self.layout.insert(2, self.clim_row)
         self.layout.insert(3, self.note_pane)
         # stacked panels as separate panes (an hv.Layout collapses beside the profile panes);
@@ -1238,9 +1252,9 @@ class CuratedPanel(PanelBase):
 
     def _dataset_changed(self, event):
         datasets = discover_curated()
-        self.compare_select.param.update(
-            groups=compare_groups(event.new, datasets) if event.new in datasets else {"": {"None": ""}},
-            value="")
+        groups = compare_groups(event.new, datasets) if event.new in datasets else {"": {"None": ""}}
+        compare = self._link.pop("compare", "") if event.new == self._link.get("dataset") else ""
+        self.compare_select.param.update(groups=groups, value=compare if compare in datasets else "")
         if event.new not in datasets:
             self.var_select.options = []
             self.clim_row.visible = False
@@ -1252,27 +1266,68 @@ class CuratedPanel(PanelBase):
                  apply=lambda names: select_first(self.var_select, names, self._replot, prefer))
 
     def open_link(self, args):
-        """Open ?product=&var=&start=&end=[&level=] (links from rca-cicoes-cresst
-        review-annotations): the newest release of the product at `level` (default
-        its lowest, so masked data still show), curation overlay on, zoomed to start–end."""
-        keys = [k for k in discover_curated() if release_of(k) and product_key(k)[1] == args.get("product")]
-        print(f"[neptunea] link {args} -> {len(keys)} release products", flush=True)
-        if not keys:
-            self.note_pane.param.update(object=f"⚠ no released product named {args.get('product')!r}", visible=True)
+        """Open a shared view, ?dataset=&var=[&compare=&start=&end=&pmin=&pmax=
+        &clim=lo,hi&cmap=&annotations=1&deployments=1&mask=0] (the Copy link
+        button), or ?product=&var=&start=&end=[&level=] (links from
+        rca-cicoes-cresst review-annotations): the newest release of the product
+        at `level` (default its lowest, so masked data still show), annotations on."""
+        datasets = discover_curated()
+        if "dataset" in args:
+            key = args["dataset"]
+        else:
+            keys = [k for k in datasets if release_of(k) and product_key(k)[1] == args.get("product")]
+            levels = {product_key(k)[2]: k for k in keys if product_key(k)[0] == product_key(keys[0])[0]}
+            key = levels.get(args.get("level"), levels[min(levels, key=QC_LEVELS.index)]) if keys else None
+            args = {"annotations": "1", **args}
+        print(f"[neptunea] link {args} -> {key}", flush=True)
+        if key not in datasets:
+            self.note_pane.param.update(
+                object=f"⚠ no product {args.get('dataset') or args.get('product')!r} in the catalog", visible=True)
             return
-        levels = {product_key(k)[2]: k for k in keys if product_key(k)[0] == product_key(keys[0])[0]}
-        key = levels.get(args.get("level"), levels[min(levels, key=QC_LEVELS.index)])
         xlim = tuple(np.datetime64(pd.Timestamp(args[k]).tz_localize(None)) for k in ("start", "end")
                      ) if "start" in args and "end" in args else None
-        self._link = dict(dataset=key, var=args.get("var"), xlim=xlim)
-        self.anno_toggle.value = True
+        ylim = (float(args["pmin"]), float(args["pmax"])) if "pmin" in args and "pmax" in args else None
+        clim = tuple(map(float, args["clim"].split(","))) if "clim" in args else None
+        self._link = dict(dataset=key, var=args.get("var"), xlim=xlim, ylim=ylim, clim=clim,
+                          compare=args.get("compare", ""), cmap=args.get("cmap"))
+        self.anno_toggle.value = args.get("annotations") == "1"
+        self.deploy_toggle.value = args.get("deployments") == "1"
+        self.mask_toggle.value = args.get("mask") != "0"
         self.dataset_select.value = key
+
+    def _update_link(self, **_):
+        """Refresh the query string the Copy link button copies."""
+        q = {"dataset": self.dataset_select.value, "var": self.var_select.value}
+        if self.compare_select.value:
+            q["compare"] = self.compare_select.value
+        rng = self._range
+        if rng is not None and rng.x_range:
+            q["start"], q["end"] = (_to_timestamp(v).isoformat(timespec="seconds") for v in sorted(rng.x_range))
+        if self.clim_row.visible:  # profiles
+            if rng is not None and rng.y_range:
+                q["pmin"], q["pmax"] = (f"{v:.1f}" for v in sorted(rng.y_range))
+            q["clim"] = ",".join(f"{v:.4g}" for v in self.clim_slider.value)
+            q["cmap"] = self.cmap_select.value
+            if not self.mask_toggle.value:
+                q["mask"] = "0"
+        for k, w in (("annotations", self.anno_toggle), ("deployments", self.deploy_toggle)):
+            if w.value:
+                q[k] = "1"
+        self.link_text.value = urlencode(q)
 
     def _var_changed(self, event):
         if not event.new:
             return
-        self.cmap_select.value = var_style(event.new)["cmap"]
+        cmap = self._link.pop("cmap", None) if event.new == self._link.get("var") else None
+        self.cmap_select.value = cmap if cmap in CMAP_OPTIONS else var_style(event.new)["cmap"]
         self._replot()
+
+    def _set_clim(self, value):
+        """Widen to cover `value`, then set it next tick: the slider's edit boxes
+        update one at a time in the browser, which clamps a start above the old end."""
+        lo, hi = self.clim_slider.value
+        self.clim_slider.value = (min(lo, value[0]), max(hi, value[1]))
+        pn.state.curdoc.add_next_tick_callback(lambda: self.clim_slider.param.update(value=tuple(value)))
 
     def _fit_view(self):
         """Set the color range to the 2–98th percentile of the visible window."""
@@ -1284,7 +1339,7 @@ class CuratedPanel(PanelBase):
             sel["sea_water_pressure"] = slice(*sorted(rng.y_range))
         lo, hi = (float(v) for v in da.sel(sel).quantile([0.02, 0.98]).values)
         if lo < hi:
-            self.clim_slider.value = (lo, hi)
+            self._set_clim((lo, hi))
 
     def _build(self):
         datasets = discover_curated()
@@ -1330,16 +1385,19 @@ class CuratedPanel(PanelBase):
         else:
             panels = [scatter_1d(da, tdim, style, bare)]
         source = panels[0]
+        rng = hv.streams.RangeXY(source=source)
         for o in overlays:
             panels = [p * o for p in panels]
         xlim = self._link.get("xlim") if (name, var) == (self._link.get("dataset"), self._link.get("var")) else None
         if xlim:
             panels = [p.opts(xlim=xlim) for p in panels]
+        if xlim and self._link.get("ylim") and da.ndim == 2:
+            panels = [p.opts(ylim=self._link["ylim"]) for p in panels]
         if spans is not None and len(spans):
             t = da[tdim].values
             panels.append(annotation_track(spans, pd.Timestamp(t[0]), pd.Timestamp(t[-1]), source, xlim,
                                            BORDERS_2D if da.ndim == 2 else BORDERS_1D))
-        return panels, clims, notes, side
+        return panels, clims, notes, side, rng
 
     def _overlays(self, name, da, notes):
         """Deployment markers and curation spans (for the annotation track), as
@@ -1408,7 +1466,8 @@ class CuratedPanel(PanelBase):
         if result is None:
             self.note_pane.visible = False
             return
-        panels, clims, notes, side = result
+        panels, clims, notes, side, self._range = result
+        self._range.add_subscriber(self._update_link)
         self.note_pane.object = "⚠ " + "; ".join(notes) if notes else ""
         self.note_pane.visible = bool(notes)
         side, self._tap = side or (None, None)
@@ -1428,12 +1487,16 @@ class CuratedPanel(PanelBase):
             lo = min(clims["bounds"][0], clims["standard"][0])
             hi = max(clims["bounds"][1], clims["standard"][1])
             key = (self.dataset_select.value, self.var_select.value)
-            reset = dict(value=clims["standard"]) if key != self._clim_key else {}
+            link = self._link.pop("clim", None) if key == (self._link.get("dataset"), self._link.get("var")) else None
+            reset = dict(value=link or clims["standard"]) if key != self._clim_key or link else {}
             self._clim_key = key
-            self.clim_slider.param.update(start=lo, end=hi, step=(hi - lo) / 500, **reset)
+            self.clim_slider.param.update(start=lo, end=hi, step=(hi - lo) / 500)
+            if reset:
+                self._set_clim(reset["value"])
         self.plot_pane.object = panels[0]
         self.more_box.objects = [pn.pane.HoloViews(p, sizing_mode="stretch_width", margin=(0, 10))
                                  for p in panels[1:]]
+        self._update_link()
 
 
 QC_FLAG_OPTIONS = ["suspect", "fail", "not_operational", "not_available", "pass"]
